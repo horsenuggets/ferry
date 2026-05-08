@@ -10,26 +10,35 @@ can skip the dead ends.
 
 ## Layout
 
-- **Mac**: client side. Runs `ferry upload` against a tunneled localhost.
-- **Windows host**: runs WSL2. Already hosting other production WSL distros
-  (don't touch). Reachable via SSH (`Host msi` in `~/.ssh/config`, default
-  shell PowerShell).
+- **Mac (client)**: runs `ferry upload` against a tunneled localhost.
+- **Windows host**: runs WSL2 with default OpenSSH (PowerShell shell).
+  Referred to below as `<ssh-host>`. The procedure assumes the host already
+  has WSL2 enabled (so at least one existing distro is fine - `FerryTest`
+  is created and destroyed in isolation and won't disturb others).
 - **FerryTest WSL distro**: throwaway. Created, used, destroyed.
+
+In all command snippets below, substitute:
+
+- `<ssh-host>` - your SSH alias for the Windows host (e.g. `msi`).
+- `<TOKEN>` - the bearer token printed during step 5.
+- `<UPLOAD_ID>` - the upload id printed by `ferry upload` on completion.
 
 ## Prerequisites
 
-- SSH access to the Windows host (in this repo: `ssh msi`).
-- The host has WSL2, ~1 GiB free disk, and at least one existing distro
-  (so the WSL feature is enabled).
-- A current `dist/ferry-linux-amd64` binary on the Mac (built via
-  `./scripts/cross.sh`).
+- SSH access to the Windows host (`ssh <ssh-host>`).
+- The host has WSL2 with ~1 GiB free disk.
+- A current ferry binary set on the Mac. Build with both:
+  ```sh
+  ./scripts/build.sh    # produces dist/ferry for the local platform (Mac client)
+  ./scripts/cross.sh    # produces dist/ferry-linux-amd64 (FerryTest receiver)
+  ```
 
 ## Procedure
 
 ### 1. Pre-flight check
 
 ```sh
-ssh msi 'wsl -l -v'
+ssh <ssh-host> 'wsl -l -v'
 ```
 
 Confirm `FerryTest` is **not** listed. The output is UTF-16; expect garbled
@@ -43,8 +52,14 @@ canonical name for jammy at the time of this run was
 `ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz` - that 404s).
 
 ```sh
-ssh msi 'New-Item -ItemType Directory C:\Temp -Force | Out-Null; New-Item -ItemType Directory C:\WSL -Force | Out-Null; $ProgressPreference="SilentlyContinue"; Invoke-WebRequest -Uri "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz" -OutFile C:\Temp\ferry-ubuntu.tar.gz -UseBasicParsing; Get-Item C:\Temp\ferry-ubuntu.tar.gz | Select Name,Length'
+ssh <ssh-host> 'New-Item -ItemType Directory C:\Temp -Force | Out-Null; New-Item -ItemType Directory C:\WSL -Force | Out-Null; $ProgressPreference="SilentlyContinue"; Invoke-WebRequest -Uri "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz" -OutFile C:\Temp\ferry-ubuntu.tar.gz; Get-Item C:\Temp\ferry-ubuntu.tar.gz | Select Name,Length'
 ```
+
+Note on `Invoke-WebRequest`: this run used Windows PowerShell 5.1, where
+`-UseBasicParsing` was sometimes needed to avoid IE-engine initialization
+errors. PowerShell 7+ ignores or rejects that flag (it was removed because
+basic parsing became the default), so the snippet above drops it. If you
+hit IE-engine errors on a 5.1-only host, add `-UseBasicParsing` back in.
 
 Expect `~341 MB`. If it's smaller, the download was truncated - delete and
 re-run. (See "Warts" below for why this happens.)
@@ -52,7 +67,7 @@ re-run. (See "Warts" below for why this happens.)
 ### 3. Import as `FerryTest`
 
 ```sh
-ssh msi 'wsl --import FerryTest C:\WSL\FerryTest C:\Temp\ferry-ubuntu.tar.gz --version 2; wsl -l -v'
+ssh <ssh-host> 'wsl --import FerryTest C:\WSL\FerryTest C:\Temp\ferry-ubuntu.tar.gz --version 2; wsl -l -v'
 ```
 
 Should report `The operation completed successfully` and `FerryTest` should
@@ -65,14 +80,23 @@ the simplest path is: scp the binary to `C:\Temp` on the Windows host, then
 copy it into FerryTest from `/mnt/c/Temp`.
 
 ```sh
-scp dist/ferry-linux-amd64 msi:C:/Temp/ferry-linux-amd64
-ssh msi 'wsl -d FerryTest -u root -- bash -c "cp /mnt/c/Temp/ferry-linux-amd64 /usr/local/bin/ferry && chmod +x /usr/local/bin/ferry && /usr/local/bin/ferry --help"'
+scp dist/ferry-linux-amd64 <ssh-host>:C:/Temp/ferry-linux-amd64
+ssh <ssh-host> 'wsl -d FerryTest -u root -- bash -c "cp /mnt/c/Temp/ferry-linux-amd64 /usr/local/bin/ferry && chmod +x /usr/local/bin/ferry && /usr/local/bin/ferry --help"'
 ```
 
 ### 5. Configure ferry on FerryTest
 
-Use the base64 script-upload pattern (see `~/.claude/docs/powershell-over-ssh.md`).
-Inline `bash -c "..."` over SSH-PowerShell-WSL gets eaten by quoting.
+Inline `bash -c "..."` over SSH-PowerShell-WSL gets eaten by quoting (the
+shell on the Windows host is PowerShell, which re-parses everything before
+WSL hands it to bash). Use the **base64 script-upload pattern** for any
+non-trivial command:
+
+1. Author the bash script locally.
+2. Base64-encode it on the Mac (`base64 < script.sh | tr -d '\n'`).
+3. Decode + write it as a real file on the Windows host using
+   `[System.IO.File]::WriteAllBytes(path, [System.Convert]::FromBase64String(b64))`,
+   which sidesteps every layer of quoting.
+4. Execute the script via `wsl -d FerryTest -u root -- bash /mnt/c/Temp/script.sh`.
 
 ```sh
 cat > /tmp/ferrytest-install.sh <<'BASH'
@@ -99,14 +123,14 @@ echo -n "$TOKEN" > /root/ferry-token.txt
 echo "TOKEN_FILE=/root/ferry-token.txt"
 BASH
 B64=$(base64 < /tmp/ferrytest-install.sh | tr -d '\n')
-ssh msi "[System.IO.File]::WriteAllBytes('C:\\Temp\\ferrytest-install.sh', [System.Convert]::FromBase64String('$B64'))"
-ssh msi 'wsl -d FerryTest -u root -- bash /mnt/c/Temp/ferrytest-install.sh'
+ssh <ssh-host> "[System.IO.File]::WriteAllBytes('C:\\Temp\\ferrytest-install.sh', [System.Convert]::FromBase64String('$B64'))"
+ssh <ssh-host> 'wsl -d FerryTest -u root -- bash /mnt/c/Temp/ferrytest-install.sh'
 ```
 
 Read the token back with:
 
 ```sh
-ssh msi 'wsl -d FerryTest -u root -- cat /root/ferry-token.txt'
+ssh <ssh-host> 'wsl -d FerryTest -u root -- cat /root/ferry-token.txt'
 ```
 
 ### 6. Start ferry under a keepalive SSH session
@@ -127,10 +151,10 @@ echo "ferry pid=$!"
 exec sleep 86400
 BASH
 B64=$(base64 < /tmp/ferrytest-keepalive.sh | tr -d '\n')
-ssh msi "[System.IO.File]::WriteAllBytes('C:\\Temp\\ferrytest-keepalive.sh', [System.Convert]::FromBase64String('$B64'))"
+ssh <ssh-host> "[System.IO.File]::WriteAllBytes('C:\\Temp\\ferrytest-keepalive.sh', [System.Convert]::FromBase64String('$B64'))"
 
 # Background SSH session that holds the distro running. Don't close until teardown.
-ssh msi 'wsl -d FerryTest -u root -- bash /mnt/c/Temp/ferrytest-keepalive.sh' &
+ssh <ssh-host> 'wsl -d FerryTest -u root -- bash /mnt/c/Temp/ferrytest-keepalive.sh' &
 KEEPALIVE_PID=$!
 ```
 
@@ -146,28 +170,31 @@ sleep 3
 curl -sS http://127.0.0.1:17421/health   # {"ok":true,"version":"0.0.1"}
 ```
 
-Targeting `10.0.0.97:7421` (the WSL2 internal address) does NOT work from
-the Windows host - Windows can't route into the distro that way. Use the
-host's loopback.
+Targeting the distro's WSL2 internal address (`hostname -I` inside FerryTest)
+directly from the Windows host does NOT work - Windows can't route into the
+distro that way without a `netsh portproxy` rule. Use the host's loopback;
+WSL2 plumbs it for you.
 
 ### 8. Generate a test file on the Mac
 
 ```sh
-dd if=/dev/urandom of=/tmp/ferry-livetest.bin bs=1m count=200
-shasum -a 256 /tmp/ferry-livetest.bin > /tmp/ferry-livetest.bin.sha256
+dd if=/dev/urandom of=/tmp/ferry-livetest-50.bin bs=1m count=50
+shasum -a 256 /tmp/ferry-livetest-50.bin > /tmp/ferry-livetest-50.bin.sha256
 ```
 
-For this run we used a smaller 50 MiB file (`ferry-livetest-50.bin`) because
-the SSH tunnel throughput was ~500 KiB/s and the 200 MiB run kept timing out
-at ~85% (see "Warts"). The 50 MiB run completed cleanly and exercised the
-same code path.
+50 MiB is the recommended size for a sanity run because the SSH-tunnel
+throughput is the bottleneck (~500 KiB/s in this run). A 200 MiB attempt
+hit a single-PATCH read-timeout at ~85% in this setup; the 50 MiB run
+completes cleanly and exercises the same code path. If you have a faster
+direct path to the host (Tailscale, host firewall rule), bump the count
+back up to 200.
 
 ### 9. Upload + resume test
 
 The CLI requires positional file argument **after** flags:
 
 ```sh
-TOKEN=$(ssh msi 'wsl -d FerryTest -u root -- cat /root/ferry-token.txt')
+TOKEN=$(ssh <ssh-host> 'wsl -d FerryTest -u root -- cat /root/ferry-token.txt')
 ./dist/ferry upload \
     --to http://127.0.0.1:17421 \
     --as livetest-50.bin \
@@ -201,7 +228,7 @@ Real run from `2026-05-08` (50 MiB file):
 # {"offset":52428800,"percent":100,"size":52428800,"state":"complete", ...}
 
 # Checksum on FerryTest
-ssh msi 'wsl -d FerryTest -u root -- bash -c "sha256sum /var/lib/ferry/data/livetest/<id>"'
+ssh <ssh-host> 'wsl -d FerryTest -u root -- bash -c "sha256sum /var/lib/ferry/data/livetest/<id>"'
 
 # Mac side
 cat /tmp/ferry-livetest-50.bin.sha256
@@ -225,13 +252,13 @@ pkill -f "ssh -N -L 17421" 2>/dev/null
 pkill -f "wsl -d FerryTest" 2>/dev/null
 
 # 2. Stop and unregister the distro
-ssh msi 'wsl --terminate FerryTest; wsl --unregister FerryTest'
+ssh <ssh-host> 'wsl --terminate FerryTest; wsl --unregister FerryTest'
 
 # 3. Clean up host files
-ssh msi 'Remove-Item C:\WSL\FerryTest -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item C:\Temp\ferry-ubuntu.tar.gz -Force -ErrorAction SilentlyContinue; Remove-Item C:\Temp\ferrytest-*.sh,C:\Temp\check-*.sh,C:\Temp\ferry-linux-amd64 -Force -ErrorAction SilentlyContinue'
+ssh <ssh-host> 'Remove-Item C:\WSL\FerryTest -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item C:\Temp\ferry-ubuntu.tar.gz -Force -ErrorAction SilentlyContinue; Remove-Item C:\Temp\ferrytest-*.sh,C:\Temp\check-*.sh,C:\Temp\ferry-linux-amd64 -Force -ErrorAction SilentlyContinue'
 
 # 4. Confirm
-ssh msi 'wsl -l -v'    # FerryTest should be gone
+ssh <ssh-host> 'wsl -l -v'    # FerryTest should be gone
 ```
 
 ```sh
@@ -253,21 +280,22 @@ rm -f /tmp/ferry-livetest*.bin /tmp/ferry-livetest*.bin.sha256 /tmp/ferry-up*.lo
   `$ProgressPreference="SilentlyContinue"` makes the foreground download
   finish faster).
 
-- **No outbound network from FerryTest**: this Windows host runs CoderFish +
-  OpenClaw distros 24/7 with extensive Docker bridges leaking into shared
-  network namespaces. New distros could ICMP `1.1.1.1` but TCP/HTTPS to
-  github.com (and 1.1.1.1) timed out. Workaround: don't `git clone` from
-  inside FerryTest. Build the binary on the Mac, scp to the host, copy in
-  via `/mnt/c/Temp`.
+- **No outbound network from FerryTest**: on this run the host had other
+  long-running distros with extensive Docker bridge networking, and the new
+  distro could ICMP `1.1.1.1` but TCP/HTTPS to github.com (and 1.1.1.1)
+  timed out. Likely a NAT or firewall interaction with the existing
+  bridges. Workaround: don't `git clone` from inside FerryTest. Build the
+  binary on the Mac, scp to the host, copy in via `/mnt/c/Temp`.
 
 - **`nohup` doesn't persist across `wsl -d --` calls**: each `wsl --exec`
   call gets its own session, and when SSH closes the session, WSL's vmcompute
   reaper SIGKILLs everything. The fix is a keepalive SSH session running
   `exec sleep 86400` so the WSL session stays alive for the whole test.
 
-- **Reaching FerryTest from the Windows host**: `curl http://10.0.0.97:7421/`
-  on the Windows host **times out**. Use `curl http://127.0.0.1:7421/` -
-  WSL2's localhost forwarding handles the routing.
+- **Reaching FerryTest from the Windows host**: curling the distro's WSL2
+  internal IP from the Windows host **times out**. Use
+  `curl http://127.0.0.1:7421/` instead - WSL2's localhost forwarding
+  handles the routing.
 
 - **CLI argument order**: `ferry upload` requires the positional `<file>`
   arg AFTER all flags. `ferry upload <file> --to ...` errors with
