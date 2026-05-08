@@ -1,0 +1,26 @@
+# Local/private files
+.env
+.local/
+*.local.*
+CLAUDE.md
+
+# Build artifacts
+dist/
+
+# Debug logs
+*.log
+
+# Worktrees
+.worktrees/
+
+# Test coverage
+coverage.out
+coverage.html
+
+# Go test binaries
+*.test
+
+# IDE noise
+.idea/
+.vscode/*
+!.vscode/settings.json
