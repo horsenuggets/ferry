@@ -21,6 +21,59 @@ Pre-release. Wire protocol unstable.
 
 Open `ferry.code-workspace` in VS Code to pick up the recommended Go editor settings.
 
+## Running the receiver
+
+```sh
+ferry listen --config /etc/ferry/config.json
+```
+
+The config file is JSON. Defaults are applied for any missing fields:
+
+```json
+{
+  "listen_addr": "0.0.0.0:7421",
+  "data_dir": "/var/lib/ferry/data",
+  "tokens_path": "/etc/ferry/tokens.json",
+  "completed_retention_seconds": 86400,
+  "incomplete_retention_seconds": 604800,
+  "max_patch_bytes": 67108864,
+  "disk_safety_margin_bytes": 1073741824
+}
+```
+
+Tokens live in a separate file (referenced by `tokens_path`) so the main config
+can be world-readable while tokens stay `0600`. Each token is stored as a
+SHA-256 hex digest; the plaintext is sent by clients via
+`Authorization: Bearer <token>`:
+
+```json
+{
+  "tokens": {
+    "<sha256-hex-of-token>": {
+      "namespaces": ["alpha", "beta"]
+    }
+  }
+}
+```
+
+A namespace value of `"*"` grants access to every namespace.
+
+### Wire protocol
+
+`ferry listen` speaks a tus-1.0.0-compatible subset:
+
+```
+POST   /v1/uploads/<namespace>            create upload (Upload-Length, optional Idempotency-Key)
+HEAD   /v1/uploads/<namespace>/<id>       report Upload-Offset
+PATCH  /v1/uploads/<namespace>/<id>       append bytes at Upload-Offset
+DELETE /v1/uploads/<namespace>/<id>       terminate
+GET    /health                            healthcheck (no Tus-Resumable required)
+```
+
+Per-PATCH bodies are capped at `max_patch_bytes`. Completed uploads are
+atomic-renamed from `<id>.partial` to `<id>` so downstream consumers can ignore
+in-progress files.
+
 ## License
 
 MIT
