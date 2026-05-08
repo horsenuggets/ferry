@@ -15,6 +15,7 @@ type Config struct {
 	TokensPath                 string `json:"tokens_path"`
 	CompletedRetentionSeconds  int64  `json:"completed_retention_seconds"`
 	IncompleteRetentionSeconds int64  `json:"incomplete_retention_seconds"`
+	GCIntervalSeconds          int64  `json:"gc_interval_seconds"`
 	MaxPatchBytes              int64  `json:"max_patch_bytes"`
 	DiskSafetyMarginBytes      int64  `json:"disk_safety_margin_bytes"`
 }
@@ -36,6 +37,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.IncompleteRetentionSeconds == 0 {
 		c.IncompleteRetentionSeconds = 604800 // 7d
+	}
+	if c.GCIntervalSeconds == 0 {
+		c.GCIntervalSeconds = 3600 // 1h
 	}
 	if c.MaxPatchBytes == 0 {
 		c.MaxPatchBytes = 64 * 1024 * 1024 // 64 MiB

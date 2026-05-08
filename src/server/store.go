@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -311,6 +312,129 @@ func (s *Store) Delete(namespace, id string) error {
 // platform-specific implementation in store_unix.go / store_windows.go.
 func (s *Store) AvailableBytes() (int64, error) {
 	return availableBytes(s.root)
+}
+
+// Truncate trims the .partial file back to size bytes. Used by checksum
+// mismatch handling to roll a failed PATCH off disk so the next attempt
+// resumes from the previous offset. fsyncs the file after the truncate so
+// the rollback survives a crash; otherwise we could respond 460 to the
+// client and then come back up still holding the bad bytes.
+func (s *Store) Truncate(namespace, id string, size int64) error {
+	path := s.partialPath(namespace, id)
+	if err := os.Truncate(path, size); err != nil {
+		return fmt.Errorf("truncate partial: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open partial after truncate: %w", err)
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("fsync after truncate: %w", err)
+	}
+	return nil
+}
+
+// ListNamespaces enumerates the immediate subdirectories of the data root.
+// Used by the GC sweeper to walk every namespace.
+func (s *Store) ListNamespaces() ([]string, error) {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return nil, fmt.Errorf("readdir data root: %w", err)
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		out = append(out, e.Name())
+	}
+	return out, nil
+}
+
+// ListUploads enumerates the upload ids in a namespace by scanning for
+// *.info sidecars. Returns ids without the .info suffix. Skips the .idem
+// directory (it has no .info entries by construction).
+func (s *Store) ListUploads(namespace string) ([]string, error) {
+	entries, err := os.ReadDir(s.nsDir(namespace))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("readdir namespace: %w", err)
+	}
+	var out []string
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".info") {
+			continue
+		}
+		out = append(out, strings.TrimSuffix(name, ".info"))
+	}
+	return out, nil
+}
+
+// HasPartial reports whether a .partial exists for the upload. Returns
+// (exists, err); a non-nil err means the answer is unknown (typically
+// permission/IO error). Callers that can't tolerate "unknown" - e.g. the
+// GC sweeper deciding whether to delete a sidecar - should err on the side
+// of keeping the upload.
+func (s *Store) HasPartial(namespace, id string) (bool, error) {
+	_, err := os.Stat(s.partialPath(namespace, id))
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("stat partial: %w", err)
+}
+
+// HasCompleted reports whether the completed (post-rename) file exists.
+// Same (bool, error) semantics as HasPartial.
+func (s *Store) HasCompleted(namespace, id string) (bool, error) {
+	_, err := os.Stat(s.completedPath(namespace, id))
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("stat completed: %w", err)
+}
+
+// ListIdemKeys enumerates idempotency-key entries in the namespace's .idem
+// directory. Returns the basenames (the keys themselves). Skips .tmp
+// half-written entries.
+func (s *Store) ListIdemKeys(namespace string) ([]string, error) {
+	dir := filepath.Join(s.nsDir(namespace), ".idem")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("readdir idem: %w", err)
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out, nil
+}
+
+// RemoveIdem deletes the idempotency-key mapping. Missing is not an error.
+func (s *Store) RemoveIdem(namespace, key string) error {
+	if err := os.Remove(s.idemPath(namespace, key)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove idem: %w", err)
+	}
+	return nil
 }
 
 // fsyncDir opens dir, fsyncs it, and closes. Required so that recent

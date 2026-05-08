@@ -271,6 +271,18 @@ func (h *Handler) patchUpload(w http.ResponseWriter, r *http.Request, namespace,
 		limit = remaining
 	}
 
+	// Optional Upload-Checksum: parse the header before reading the body so
+	// we can fail fast on an unsupported algorithm. The hash is then
+	// computed via TeeReader, so every byte the client streams to us is
+	// also fed into the hash. We compare after AppendChunk returns and, on
+	// mismatch, truncate the .partial back to `currentOffset` so the next
+	// PATCH from the client resumes from the same place.
+	expected, hasher, err := parseUploadChecksum(r.Header.Get("Upload-Checksum"))
+	if err != nil {
+		writeError(w, err, "")
+		return
+	}
+
 	// Cap reads at exactly `limit` bytes. If the client tries to send more,
 	// MaxBytesReader returns an error after `limit` bytes have already
 	// been delivered to AppendChunk - so we never write more than `limit`
@@ -279,9 +291,12 @@ func (h *Handler) patchUpload(w http.ResponseWriter, r *http.Request, namespace,
 
 	// Wrap body in a context-aware reader so cooperative cancel actually
 	// stops the io.Copy.
-	cr := &ctxReader{ctx: ctx, r: body}
+	var src io.Reader = &ctxReader{ctx: ctx, r: body}
+	if hasher != nil {
+		src = io.TeeReader(src, hasher)
+	}
 
-	n, copyErr := h.store.AppendChunk(namespace, id, cr, limit)
+	n, copyErr := h.store.AppendChunk(namespace, id, src, limit)
 	newOffset := currentOffset + n
 
 	// MaxBytesReader signals over-cap with *http.MaxBytesError.
@@ -301,6 +316,27 @@ func (h *Handler) patchUpload(w http.ResponseWriter, r *http.Request, namespace,
 		w.Header().Set("Upload-Offset", strconv.FormatInt(newOffset, 10))
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+
+	// Verify the checksum (if any) of the bytes we just appended. If it
+	// doesn't match, roll the .partial back to the pre-PATCH offset and
+	// return 460 - the next PATCH from the client resumes from the same
+	// `currentOffset` and can re-send the corrupted chunk.
+	if hasher != nil && copyErr == nil {
+		got := hasher.Sum(nil)
+		if !hashesEqual(got, expected) {
+			if err := h.store.Truncate(namespace, id, currentOffset); err != nil {
+				h.logger.Error("truncate after checksum mismatch failed",
+					"namespace", namespace, "id", id, "err", err)
+				writeError(w, ErrInternal, "")
+				return
+			}
+			h.logger.Warn("patch checksum mismatch",
+				"namespace", namespace, "id", id,
+				"wrote", n, "rolled_back_to", currentOffset)
+			writeError(w, ErrChecksumMismatch, "")
+			return
+		}
 	}
 
 	// On full completion, atomically rename + mark sidecar.

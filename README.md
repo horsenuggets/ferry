@@ -36,10 +36,20 @@ The config file is JSON. Defaults are applied for any missing fields:
   "tokens_path": "/etc/ferry/tokens.json",
   "completed_retention_seconds": 86400,
   "incomplete_retention_seconds": 604800,
+  "gc_interval_seconds": 3600,
   "max_patch_bytes": 67108864,
   "disk_safety_margin_bytes": 1073741824
 }
 ```
+
+A background sweeper runs every `gc_interval_seconds` and removes:
+- completed uploads older than `completed_retention_seconds`
+- incomplete uploads past `expires_at` (`created_at + incomplete_retention_seconds`)
+- orphan `.info` sidecars whose binary is missing
+- `.idem` mappings whose target upload is gone
+
+The sweeper takes each upload's lock with a tight deadline, so an in-flight
+PATCH always wins.
 
 Tokens live in a separate file (referenced by `tokens_path`) so the main config
 can be world-readable while tokens stay `0600`. Each token is stored as a
@@ -73,6 +83,11 @@ GET    /health                            healthcheck (no Tus-Resumable required
 Per-PATCH bodies are capped at `max_patch_bytes`. Completed uploads are
 atomic-renamed from `<id>.partial` to `<id>` so downstream consumers can ignore
 in-progress files.
+
+PATCH requests may include `Upload-Checksum: <algo> <hex>` to have the server
+hash the bytes as they arrive and 460 + truncate-back on mismatch. Supported
+algorithms: `crc32c` (default; clients send this unless `--no-checksum` is
+passed) and `sha256`.
 
 ## Install on Linux
 
