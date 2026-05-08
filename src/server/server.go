@@ -32,7 +32,9 @@ func New(cfg *Config, version string, logger *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load tokens: %w", err)
 	}
-	store, err := NewStore(cfg.DataDir)
+	// Route the store's structured timing logs through the same logger
+	// the rest of the server uses (JSON to stderr in production).
+	store, err := NewStoreWithLogger(cfg.DataDir, logger)
 	if err != nil {
 		return nil, fmt.Errorf("init store: %w", err)
 	}

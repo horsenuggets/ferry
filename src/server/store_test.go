@@ -2,7 +2,11 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,14 +79,14 @@ func TestStoreAppendAndComplete(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := strings.NewReader("hello world") // 11 bytes
-	n, err := s.AppendChunk("alpha", "u1", body, 100)
+	n, err := s.AppendChunk(context.Background(), "alpha", "u1", body, 100, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 11 {
 		t.Errorf("wrote %d, want 11", n)
 	}
-	if err := s.Complete("alpha", "u1"); err != nil {
+	if err := s.Complete(context.Background(), "alpha", "u1"); err != nil {
 		t.Fatal(err)
 	}
 	// Atomic-rename: .partial gone, completed exists.
@@ -181,5 +185,159 @@ func TestStoreInfoAtomicOnDisk(t *testing.T) {
 	}
 	if loaded.Metadata["filename"] != "test.bin" {
 		t.Errorf("metadata round-trip lost: %+v", loaded.Metadata)
+	}
+}
+
+// captureSlog returns a fresh slog.Logger that writes JSONL to buf, plus the
+// buf for read-back. Used by the structured-timing tests below.
+func captureSlog(t *testing.T) (*slog.Logger, *bytes.Buffer) {
+	t.Helper()
+	var buf bytes.Buffer
+	h := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	return slog.New(h), &buf
+}
+
+// readLogEvents parses each JSON line in buf and returns the parsed maps,
+// keyed by the "msg" field for cheap lookup.
+func readLogEvents(t *testing.T, buf *bytes.Buffer) map[string]map[string]any {
+	t.Helper()
+	out := make(map[string]map[string]any)
+	for {
+		line, err := buf.ReadBytes('\n')
+		if len(line) > 0 {
+			var ev map[string]any
+			if jerr := json.Unmarshal(line, &ev); jerr != nil {
+				t.Fatalf("unmarshal log line %q: %v", line, jerr)
+			}
+			if msg, _ := ev["msg"].(string); msg != "" {
+				out[msg] = ev
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return out
+}
+
+func newTestStoreWithLogger(t *testing.T, logger *slog.Logger) *Store {
+	t.Helper()
+	dir := t.TempDir()
+	s, err := NewStoreWithLogger(dir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestStoreCompleteEmitsTimingLogs(t *testing.T) {
+	logger, buf := captureSlog(t)
+	s := newTestStoreWithLogger(t, logger)
+
+	info := sampleInfo("u1")
+	if err := s.Create(info); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.NewReader("hello world") // 11 bytes (matches sampleInfo.Size)
+	if _, err := s.AppendChunk(context.Background(), "alpha", "u1", body, 100, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Complete(context.Background(), "alpha", "u1"); err != nil {
+		t.Fatal(err)
+	}
+
+	events := readLogEvents(t, buf)
+
+	want := []string{
+		"ferry.chunk_write",
+		"ferry.chunk_fsync",
+		"ferry.partial_open",
+		"ferry.partial_fsync",
+		"ferry.partial_rename",
+		"ferry.parent_dir_fsync",
+		"ferry.info_load",
+		"ferry.info_completed_write",
+		"ferry.info_completed_fsync",
+		"ferry.info_completed_rename",
+		"ferry.info_completed_dir_fsync",
+		"ferry.upload_complete",
+	}
+	for _, name := range want {
+		ev, ok := events[name]
+		if !ok {
+			t.Errorf("missing log event %q", name)
+			continue
+		}
+		// elapsed is rendered as a number (nanoseconds) by JSONHandler.
+		elapsed, ok := ev["elapsed"].(float64)
+		if !ok {
+			t.Errorf("event %q has no numeric elapsed: %#v", name, ev["elapsed"])
+			continue
+		}
+		if elapsed <= 0 {
+			t.Errorf("event %q elapsed = %v, want > 0", name, elapsed)
+		}
+		if got, _ := ev["upload_id"].(string); got != "u1" {
+			t.Errorf("event %q upload_id = %q, want u1", name, got)
+		}
+		if got, _ := ev["namespace"].(string); got != "alpha" {
+			t.Errorf("event %q namespace = %q, want alpha", name, got)
+		}
+		// happy-path: every entry should be at INFO level.
+		if got, _ := ev["level"].(string); got != "INFO" {
+			t.Errorf("event %q level = %q, want INFO", name, got)
+		}
+	}
+
+	// chunk_write is_final=true (this PATCH finishes the upload) and
+	// carries the byte count alongside elapsed in a single event.
+	if ev := events["ferry.chunk_write"]; ev != nil {
+		if got, _ := ev["is_final"].(bool); !got {
+			t.Errorf("chunk_write is_final = %v, want true", got)
+		}
+		if got, _ := ev["bytes"].(float64); got != 11 {
+			t.Errorf("chunk_write bytes = %v, want 11", got)
+		}
+	}
+	// upload_complete carries the byte count.
+	if ev := events["ferry.upload_complete"]; ev != nil {
+		if got, _ := ev["bytes"].(float64); got != 11 {
+			t.Errorf("upload_complete bytes = %v, want 11", got)
+		}
+	}
+}
+
+func TestStoreCompleteLogsWarnOnError(t *testing.T) {
+	logger, buf := captureSlog(t)
+	s := newTestStoreWithLogger(t, logger)
+
+	// Complete on an upload that has no .partial - the partial_open step
+	// must fail, emit a WARN entry with an error attribute, and the
+	// upload_complete summary must also be at WARN.
+	err := s.Complete(context.Background(), "alpha", "ghost")
+	if err == nil {
+		t.Fatalf("Complete on missing partial should error")
+	}
+
+	events := readLogEvents(t, buf)
+	open, ok := events["ferry.partial_open"]
+	if !ok {
+		t.Fatalf("missing ferry.partial_open event")
+	}
+	if got, _ := open["level"].(string); got != "WARN" {
+		t.Errorf("partial_open level = %q, want WARN", got)
+	}
+	if got, _ := open["error"].(string); got == "" {
+		t.Errorf("partial_open missing error attribute")
+	}
+	summary, ok := events["ferry.upload_complete"]
+	if !ok {
+		t.Fatalf("missing ferry.upload_complete event")
+	}
+	if got, _ := summary["level"].(string); got != "WARN" {
+		t.Errorf("upload_complete level = %q, want WARN", got)
 	}
 }

@@ -296,7 +296,11 @@ func (h *Handler) patchUpload(w http.ResponseWriter, r *http.Request, namespace,
 		src = io.TeeReader(src, hasher)
 	}
 
-	n, copyErr := h.store.AppendChunk(namespace, id, src, limit)
+	// Hint to the store whether this PATCH is sized to finish the upload,
+	// so the structured timing logs can distinguish the final PATCH from
+	// intermediate ones.
+	isFinal := currentOffset+limit == info.Size
+	n, copyErr := h.store.AppendChunk(ctx, namespace, id, src, limit, isFinal)
 	newOffset := currentOffset + n
 
 	// MaxBytesReader signals over-cap with *http.MaxBytesError.
@@ -341,7 +345,7 @@ func (h *Handler) patchUpload(w http.ResponseWriter, r *http.Request, namespace,
 
 	// On full completion, atomically rename + mark sidecar.
 	if newOffset == info.Size {
-		if err := h.store.Complete(namespace, id); err != nil {
+		if err := h.store.Complete(ctx, namespace, id); err != nil {
 			h.logger.Error("complete failed",
 				"namespace", namespace, "id", id, "err", err)
 			writeError(w, ErrInternal, "")
