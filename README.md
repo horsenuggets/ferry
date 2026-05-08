@@ -74,6 +74,31 @@ Per-PATCH bodies are capped at `max_patch_bytes`. Completed uploads are
 atomic-renamed from `<id>.partial` to `<id>` so downstream consumers can ignore
 in-progress files.
 
+## Install on Linux
+
+Build the binary for your target, then run the installer as root:
+
+```sh
+./scripts/build.sh
+sudo ./scripts/install.sh
+sudo $EDITOR /etc/ferry/tokens.json
+sudo systemctl restart ferry
+```
+
+The installer creates a system `ferry` user, lays down `/etc/ferry/`,
+`/var/lib/ferry/data/`, and `/var/log/ferry/` with the right ownership, and
+installs and enables the `ferry.service` systemd unit.
+
+Useful flags:
+
+- `--binary <path>` - install a specific binary instead of `dist/ferry-linux-<arch>`
+- `--config-only` - just install config + service, skip the binary
+- `--dry-run` - print actions without changing anything
+- `--prefix <path>` - install the binary under `<prefix>/bin/ferry` (default `/usr/local`)
+
+Uninstall with `sudo ./scripts/uninstall.sh`. Add `--purge` to also delete
+config, data, and the `ferry` user.
+
 ## License
 
 MIT
