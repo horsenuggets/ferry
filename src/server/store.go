@@ -8,8 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // Info is the persisted sidecar metadata for an upload (.info file). The
@@ -272,15 +270,10 @@ func (s *Store) Delete(namespace, id string) error {
 	return fsyncDir(s.nsDir(namespace))
 }
 
-// AvailableBytes returns the bytes free at the data root, via statfs.
+// AvailableBytes returns the bytes free at the data root, via the
+// platform-specific implementation in store_unix.go / store_windows.go.
 func (s *Store) AvailableBytes() (int64, error) {
-	var fs unix.Statfs_t
-	if err := unix.Statfs(s.root, &fs); err != nil {
-		return 0, fmt.Errorf("statfs: %w", err)
-	}
-	// Bavail/Bsize are unsigned; the products fit comfortably in int64 for
-	// any sane filesystem.
-	return int64(fs.Bavail) * int64(fs.Bsize), nil
+	return availableBytes(s.root)
 }
 
 // fsyncDir opens dir, fsyncs it, and closes. Required so that recent
