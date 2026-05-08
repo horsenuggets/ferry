@@ -42,22 +42,36 @@ type Store struct {
 
 // NewStore constructs a Store rooted at root, creating the root directory
 // (and any missing parents) if needed. Namespace subdirs are created
-// lazily on first Create. The store logs structured timing events to
-// slog.Default(); use SetLogger to override.
+// lazily on first Create. Structured timing events go to slog.Default;
+// callers that want a custom logger should use NewStoreWithLogger.
 func NewStore(root string) (*Store, error) {
+	return NewStoreWithLogger(root, nil)
+}
+
+// NewStoreWithLogger is NewStore but takes an explicit *slog.Logger for
+// the store's structured timing events. A nil logger falls back to
+// slog.Default. The logger is set once at construction and never
+// mutated, so methods on Store are safe for concurrent use without
+// additional synchronization.
+func NewStoreWithLogger(root string, logger *slog.Logger) (*Store, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir data root: %w", err)
 	}
-	return &Store{root: root, logger: slog.Default()}, nil
-}
-
-// SetLogger overrides the slog.Logger used for the store's structured
-// timing events. A nil logger falls back to slog.Default.
-func (s *Store) SetLogger(logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s.logger = logger
+	return &Store{root: root, logger: logger}, nil
+}
+
+// log returns the store's logger, falling back to slog.Default if the
+// store was somehow constructed with a nil logger. Centralizing the
+// fallback here keeps the "nil => slog.Default" contract consistent
+// across timed() and any direct LogAttrs callsites.
+func (s *Store) log() *slog.Logger {
+	if s.logger == nil {
+		return slog.Default()
+	}
+	return s.logger
 }
 
 // timed runs fn, measures its wall-clock duration, and emits a structured
@@ -65,10 +79,7 @@ func (s *Store) SetLogger(logger *slog.Logger) {
 // duration. Failures are logged at WARN with the error stringified;
 // successes are logged at INFO.
 func (s *Store) timed(ctx context.Context, op string, attrs []slog.Attr, fn func() error) error {
-	logger := s.logger
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger := s.log()
 	start := time.Now()
 	err := fn()
 	elapsed := time.Since(start)
@@ -273,27 +284,22 @@ func (s *Store) AppendChunk(ctx context.Context, namespace, id string, src io.Re
 		slog.Bool("is_final", isFinal),
 	}
 
+	// chunk_write: time the io.Copy and record the byte count we actually
+	// moved on the same event. Done inline rather than via timed() so we
+	// can include the post-hoc byte count attr in a single log entry.
 	limited := io.LimitReader(src, limit)
-	var n int64
-	var copyErr error
-	_ = s.timed(ctx, "chunk_write", baseAttrs, func() error {
-		n, copyErr = io.Copy(f, limited)
-		// Surface only fatal opener-style errors here; the io.Copy error
-		// is forwarded through copyErr and reported by the caller. We
-		// still want a non-nil return to flip the entry to WARN if the
-		// copy fundamentally failed.
-		if copyErr != nil && !errors.Is(copyErr, io.EOF) {
-			return copyErr
-		}
-		return nil
-	})
-	// Annotate with the byte count we actually moved.
-	s.logger.LogAttrs(ctx, slog.LevelDebug, "ferry.chunk_write.bytes",
-		slog.String("upload_id", id),
-		slog.String("namespace", namespace),
-		slog.Bool("is_final", isFinal),
-		slog.Int64("bytes", n),
-	)
+	logger := s.log()
+	cwStart := time.Now()
+	n, copyErr := io.Copy(f, limited)
+	cwElapsed := time.Since(cwStart)
+	cwAttrs := append([]slog.Attr{}, baseAttrs...)
+	cwAttrs = append(cwAttrs, slog.Int64("bytes", n), slog.Duration("elapsed", cwElapsed))
+	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
+		cwAttrs = append(cwAttrs, slog.String("error", copyErr.Error()))
+		logger.LogAttrs(ctx, slog.LevelWarn, "ferry.chunk_write", cwAttrs...)
+	} else {
+		logger.LogAttrs(ctx, slog.LevelInfo, "ferry.chunk_write", cwAttrs...)
+	}
 
 	// Always fsync what made it to disk, even on copy error, so the next
 	// HEAD reflects reality. Treat fsync EIO as fatal: we surface the
@@ -349,7 +355,7 @@ func (s *Store) Complete(ctx context.Context, namespace, id string) error {
 			attrs = append(attrs, slog.String("error", err.Error()))
 			level = slog.LevelWarn
 		}
-		s.logger.LogAttrs(ctx, level, "ferry.upload_complete", attrs...)
+		s.log().LogAttrs(ctx, level, "ferry.upload_complete", attrs...)
 	}
 
 	// fsync the data file before rename.

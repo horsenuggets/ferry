@@ -223,10 +223,19 @@ func readLogEvents(t *testing.T, buf *bytes.Buffer) map[string]map[string]any {
 	return out
 }
 
+func newTestStoreWithLogger(t *testing.T, logger *slog.Logger) *Store {
+	t.Helper()
+	dir := t.TempDir()
+	s, err := NewStoreWithLogger(dir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 func TestStoreCompleteEmitsTimingLogs(t *testing.T) {
-	s := newTestStore(t)
 	logger, buf := captureSlog(t)
-	s.SetLogger(logger)
+	s := newTestStoreWithLogger(t, logger)
 
 	info := sampleInfo("u1")
 	if err := s.Create(info); err != nil {
@@ -283,10 +292,14 @@ func TestStoreCompleteEmitsTimingLogs(t *testing.T) {
 		}
 	}
 
-	// chunk_write is_final=true (this PATCH finishes the upload).
+	// chunk_write is_final=true (this PATCH finishes the upload) and
+	// carries the byte count alongside elapsed in a single event.
 	if ev := events["ferry.chunk_write"]; ev != nil {
 		if got, _ := ev["is_final"].(bool); !got {
 			t.Errorf("chunk_write is_final = %v, want true", got)
+		}
+		if got, _ := ev["bytes"].(float64); got != 11 {
+			t.Errorf("chunk_write bytes = %v, want 11", got)
 		}
 	}
 	// upload_complete carries the byte count.
@@ -298,9 +311,8 @@ func TestStoreCompleteEmitsTimingLogs(t *testing.T) {
 }
 
 func TestStoreCompleteLogsWarnOnError(t *testing.T) {
-	s := newTestStore(t)
 	logger, buf := captureSlog(t)
-	s.SetLogger(logger)
+	s := newTestStoreWithLogger(t, logger)
 
 	// Complete on an upload that has no .partial - the partial_open step
 	// must fail, emit a WARN entry with an error attribute, and the
