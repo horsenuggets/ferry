@@ -89,6 +89,23 @@ hash the bytes as they arrive and 460 + truncate-back on mismatch. Supported
 algorithms: `crc32c` (default; clients send this unless `--no-checksum` is
 passed) and `sha256`.
 
+### MTU on encapsulated paths
+
+When the receiver lives behind an encapsulating layer (NAT-mode WSL2,
+Hyper-V vswitch, Docker bridges with custom networks, WireGuard, GRE,
+IPsec), the path MTU is below the standard 1500 bytes. WSL2 in NAT mode
+on Windows 11 24H2 measures at 1420; Docker bridges layered on top
+inherit that floor.
+
+Align container and bridge MTUs with the underlying interface. For
+Docker, set `"mtu": 1420` in `daemon.json` or `--mtu=1420` per network.
+For systemd-networkd bridges, set `MTUBytes=1420`. ferry's TCP path
+relies on kernel-level segmentation, so it will not produce
+DF+oversized packets even with a misaligned MTU - but anything
+co-resident on the same host that bypasses the kernel's TCP stack
+(e.g., raw QUIC or SCTP experiments) needs the same MTU floor or it
+will PMTUD-blackhole on the encapsulated hop.
+
 ## Install on Linux
 
 Build the binary for your target, then run the installer as root:
