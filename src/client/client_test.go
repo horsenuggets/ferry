@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -395,5 +394,3 @@ func TestClient_IdempotentResume(t *testing.T) {
 	_ = want // bytes already verified by earlier tests
 }
 
-// jsonAny is a tiny helper for type assertions; unused fields shut up linters.
-type jsonAny = json.RawMessage
