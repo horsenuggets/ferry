@@ -22,5 +22,4 @@ coverage.html
 
 # IDE noise
 .idea/
-.vscode/*
-!.vscode/settings.json
+.vscode/
