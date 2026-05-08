@@ -13,9 +13,9 @@ import (
 	"time"
 )
 
-// TestServerRunIntegration spins up a real Server.Run on an OS-assigned port,
-// performs a full POST/PATCH/HEAD/DELETE cycle, and verifies the file lands
-// on disk, then cancels the context to shut down cleanly.
+// TestServerRunIntegration spins up a real Server.Run on an OS-assigned
+// port (":0"), performs POST + PATCH + HEAD + DELETE end-to-end, verifies
+// the file lands on disk, then cancels the context to shut down cleanly.
 func TestServerRunIntegration(t *testing.T) {
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "data")
@@ -28,30 +28,36 @@ func TestServerRunIntegration(t *testing.T) {
 	}
 
 	cfg := &Config{
-		ListenAddr: "127.0.0.1:0",
+		ListenAddr: "127.0.0.1:0", // ephemeral port
 		DataDir:    dataDir,
 		TokensPath: tokensPath,
 	}
 	cfg.ApplyDefaults()
-	cfg.ListenAddr = "127.0.0.1:0" // bypass default
+	cfg.ListenAddr = "127.0.0.1:0"
 
 	srv, err := New(cfg, "test-version", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// We can't easily learn the resolved port from Run, so use httptest
-	// pattern: bind manually. But to actually exercise Run, we test it
-	// end-to-end with a shutdown signal. Use a fixed high port.
-	cfg.ListenAddr = "127.0.0.1:17421"
-
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- srv.Run(ctx, "test-version") }()
 
-	// Wait for server to start.
-	deadline := time.After(2 * time.Second)
-	base := "http://127.0.0.1:17421"
+	// Wait for the listener to become ready (Addr populated by Run).
+	deadline := time.After(3 * time.Second)
+	for srv.Addr() == "" {
+		select {
+		case <-deadline:
+			t.Fatal("server didn't bind")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	base := "http://" + srv.Addr()
+
+	// Wait for /health to respond (server.Run goroutine may still be
+	// installing handlers).
 	for {
 		resp, err := http.Get(base + "/health")
 		if err == nil {
@@ -60,9 +66,9 @@ func TestServerRunIntegration(t *testing.T) {
 		}
 		select {
 		case <-deadline:
-			t.Fatal("server didn't start")
+			t.Fatalf("health never responded: %v", err)
 		default:
-			time.Sleep(20 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 
@@ -80,8 +86,9 @@ func TestServerRunIntegration(t *testing.T) {
 		t.Fatalf("POST status = %d", resp.StatusCode)
 	}
 	loc := resp.Header.Get("Location")
+	id := loc[len("/v1/uploads/alpha/"):]
 
-	// PATCH full body.
+	// PATCH full body -> completes the upload.
 	req2, _ := http.NewRequest("PATCH", base+loc, bytes.NewReader([]byte("hello")))
 	req2.Header.Set("Tus-Resumable", tusVersion)
 	req2.Header.Set("Authorization", "Bearer "+token)
@@ -100,19 +107,61 @@ func TestServerRunIntegration(t *testing.T) {
 		t.Errorf("offset = %q", resp2.Header.Get("Upload-Offset"))
 	}
 
-	// Health body shape.
+	// Verify the completed file is on disk after atomic-rename.
+	completed := filepath.Join(dataDir, "alpha", id)
+	body, err := os.ReadFile(completed) //nolint:gosec // test-only path
+	if err != nil {
+		t.Fatalf("read completed file: %v", err)
+	}
+	if string(body) != "hello" {
+		t.Errorf("on-disk = %q, want %q", body, "hello")
+	}
+
+	// HEAD - completed upload reports offset == size.
+	req3, _ := http.NewRequest("HEAD", base+loc, nil)
+	req3.Header.Set("Tus-Resumable", tusVersion)
+	req3.Header.Set("Authorization", "Bearer "+token)
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		t.Errorf("HEAD status = %d", resp3.StatusCode)
+	}
+	if resp3.Header.Get("Upload-Offset") != "5" {
+		t.Errorf("HEAD offset = %q", resp3.Header.Get("Upload-Offset"))
+	}
+
+	// /health body shape.
 	hresp, err := http.Get(base + "/health")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer hresp.Body.Close()
-	body, _ := io.ReadAll(hresp.Body)
+	hbody, _ := io.ReadAll(hresp.Body)
 	var got map[string]any
-	if err := json.Unmarshal(body, &got); err != nil {
+	if err := json.Unmarshal(hbody, &got); err != nil {
 		t.Fatal(err)
 	}
 	if got["ok"] != true || got["version"] != "test-version" {
 		t.Errorf("health body = %v", got)
+	}
+
+	// DELETE removes the upload + sidecar.
+	req4, _ := http.NewRequest("DELETE", base+loc, nil)
+	req4.Header.Set("Tus-Resumable", tusVersion)
+	req4.Header.Set("Authorization", "Bearer "+token)
+	resp4, err := http.DefaultClient.Do(req4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusNoContent {
+		t.Errorf("DELETE status = %d", resp4.StatusCode)
+	}
+	if _, err := os.Stat(completed); !os.IsNotExist(err) {
+		t.Errorf("completed file still exists after DELETE: %v", err)
 	}
 
 	// Shutdown.
@@ -295,6 +344,62 @@ func TestMethodNotAllowed(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want 405", resp.StatusCode)
+	}
+}
+
+func TestValidNamespace(t *testing.T) {
+	cases := map[string]bool{
+		"alpha":                        true,
+		"alpha-1":                      true,
+		"alpha_beta":                   true,
+		"":                             false,
+		"..":                           false,
+		"a/b":                          false,
+		"a b":                          false,
+		"with.dot":                     false,
+		"x" + string(make([]byte, 64)): false, // > 64
+	}
+	for s, want := range cases {
+		if got := validNamespace(s); got != want {
+			t.Errorf("validNamespace(%q) = %v, want %v", s, got, want)
+		}
+	}
+}
+
+func TestValidIdemKey(t *testing.T) {
+	if !validIdemKey("post.user.123") {
+		t.Errorf("dotted idem key rejected")
+	}
+	if validIdemKey("../escape") {
+		t.Errorf("traversal idem key accepted")
+	}
+	if validIdemKey("") {
+		t.Errorf("empty idem key accepted")
+	}
+}
+
+func TestPostRejectsTraversalNamespace(t *testing.T) {
+	r := newRig(t)
+	req, _ := http.NewRequest("POST", r.srv.URL+"/v1/uploads/..", nil)
+	req.Header.Set("Tus-Resumable", tusVersion)
+	req.Header.Set("Authorization", "Bearer "+r.token)
+	req.Header.Set("Upload-Length", "1")
+	resp := r.do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("traversal namespace status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestPostRejectsBadIdempotencyKey(t *testing.T) {
+	r := newRig(t)
+	req := r.newReq(t, "POST", "/v1/uploads/alpha", nil)
+	req.Header.Set("Upload-Length", "1")
+	req.Header.Set("Idempotency-Key", "../escape")
+	resp := r.do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("bad idem status = %d, want 400", resp.StatusCode)
 	}
 }
 

@@ -129,6 +129,10 @@ func (h *Handler) postUpload(w http.ResponseWriter, r *http.Request, namespace s
 	// existing upload's URL with 200 OK instead of creating a new one.
 	idemKey := r.Header.Get("Idempotency-Key")
 	if idemKey != "" {
+		if !validIdemKey(idemKey) {
+			http.Error(w, "invalid Idempotency-Key", http.StatusBadRequest)
+			return
+		}
 		if existingID, err := h.store.LookupIdem(namespace, idemKey); err != nil {
 			writeError(w, err, "")
 			return
@@ -169,7 +173,7 @@ func (h *Handler) postUpload(w http.ResponseWriter, r *http.Request, namespace s
 	}
 
 	w.Header().Set("Location", uploadLocation(namespace, info.ID))
-	w.Header().Set("Upload-Expires", info.ExpiresAt.Format(time.RFC1123))
+	w.Header().Set("Upload-Expires", info.ExpiresAt.UTC().Format(http.TimeFormat))
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -248,54 +252,54 @@ func (h *Handler) patchUpload(w http.ResponseWriter, r *http.Request, namespace,
 		writeError(w, ErrMismatchOffset, "")
 		return
 	}
+	// Defensive: if a previous bug or external mutation pushed the on-disk
+	// size past the declared length, refuse to accept more bytes. Better
+	// to surface this clearly than to feed it to a negative limit below.
+	if currentOffset > info.Size {
+		h.logger.Error("on-disk size exceeds declared size",
+			"namespace", namespace, "id", id,
+			"on_disk", currentOffset, "declared", info.Size)
+		writeError(w, ErrInternal, "")
+		return
+	}
 
-	// remaining is how many bytes we'll actually accept on this request.
+	// limit is how many bytes we'll accept on this PATCH. Bounded by the
+	// remaining space in the upload AND the per-PATCH cap.
 	remaining := info.Size - currentOffset
 	limit := h.maxPatchBytes
 	if remaining < limit {
 		limit = remaining
 	}
-	// We also cap by content-length+1 to detect overruns. Cap by limit+1
-	// gives io.Copy room to read one extra byte and trigger an error if
-	// the body is over-long.
-	body := http.MaxBytesReader(w, r.Body, limit+1)
+
+	// Cap reads at exactly `limit` bytes. If the client tries to send more,
+	// MaxBytesReader returns an error after `limit` bytes have already
+	// been delivered to AppendChunk - so we never write more than `limit`
+	// bytes to disk before bailing with 413.
+	body := http.MaxBytesReader(w, r.Body, limit)
 
 	// Wrap body in a context-aware reader so cooperative cancel actually
 	// stops the io.Copy.
 	cr := &ctxReader{ctx: ctx, r: body}
 
-	n, copyErr := h.store.AppendChunk(namespace, id, cr, limit+1)
+	n, copyErr := h.store.AppendChunk(namespace, id, cr, limit)
 	newOffset := currentOffset + n
+
+	// MaxBytesReader signals over-cap with *http.MaxBytesError.
+	if copyErr != nil && isMaxBytesError(copyErr) {
+		writeError(w, ErrSizeExceeded, "")
+		return
+	}
 
 	// If the body was trimmed/canceled mid-flight (peer hung up, we got
 	// ousted by another acquirer), persist what we have and return - the
 	// next request resumes from on-disk size. We do NOT 500 in that case.
 	if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, context.Canceled) {
-		// Body too long?
-		if n > limit {
-			writeError(w, ErrSizeExceeded, "")
-			return
-		}
-		// Real error - the partial bytes are still on disk, but we tell
-		// the client the request didn't complete. They'll HEAD to recover.
 		h.logger.Warn("patch interrupted",
 			"namespace", namespace, "id", id, "wrote", n, "err", copyErr)
-		// If the underlying error was a max-bytes overrun, that's 413.
-		if isMaxBytesError(copyErr) {
-			writeError(w, ErrSizeExceeded, "")
-			return
-		}
-		// Otherwise, it's a connection/cancel - close without status. The
-		// client retries via HEAD.
+		// Connection/cancel - the partial bytes are on disk; tell the
+		// client the new offset and let them HEAD to verify.
 		w.Header().Set("Upload-Offset", strconv.FormatInt(newOffset, 10))
-		// We still send 204 with the new offset so well-behaved clients
-		// keep going. (tusd does similar.)
 		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if n > limit {
-		writeError(w, ErrSizeExceeded, "")
 		return
 	}
 

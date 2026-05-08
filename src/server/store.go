@@ -36,8 +36,9 @@ type Store struct {
 	root string
 }
 
-// NewStore constructs a Store rooted at root. Root must exist; namespace
-// subdirs are created lazily.
+// NewStore constructs a Store rooted at root, creating the root directory
+// (and any missing parents) if needed. Namespace subdirs are created
+// lazily on first Create.
 func NewStore(root string) (*Store, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir data root: %w", err)
@@ -67,25 +68,33 @@ func (s *Store) idemPath(namespace, key string) string {
 }
 
 // Create initializes a new upload: an empty .partial file, a sidecar .info,
-// and (if idempotencyKey != "") an idem mapping. Returns the canonical Info.
+// and (if idempotencyKey != "") an idem mapping. On failure of any step
+// past the .partial creation, best-effort cleans up partially-written
+// files so failed creates don't accumulate orphans.
 func (s *Store) Create(info Info) error {
 	dir := s.nsDir(info.Namespace)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir namespace: %w", err)
 	}
+	partial := s.partialPath(info.Namespace, info.ID)
 	// Create empty .partial.
-	f, err := os.OpenFile(s.partialPath(info.Namespace, info.ID), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	f, err := os.OpenFile(partial, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
 	if err != nil {
 		return fmt.Errorf("create partial: %w", err)
 	}
 	if err := f.Close(); err != nil {
+		_ = os.Remove(partial)
 		return fmt.Errorf("close partial: %w", err)
 	}
 	if err := s.writeInfo(info); err != nil {
+		_ = os.Remove(partial)
+		_ = os.Remove(s.infoPath(info.Namespace, info.ID))
 		return err
 	}
 	if info.IdempotencyKey != "" {
 		if err := s.writeIdem(info.Namespace, info.IdempotencyKey, info.ID); err != nil {
+			_ = os.Remove(partial)
+			_ = os.Remove(s.infoPath(info.Namespace, info.ID))
 			return err
 		}
 	}
@@ -124,7 +133,9 @@ func (s *Store) writeInfo(info Info) error {
 	return fsyncDir(dir)
 }
 
-// writeIdem records an idempotency-key -> upload-id mapping.
+// writeIdem records an idempotency-key -> upload-id mapping. Uses the
+// same write-tmp + fsync + rename + fsync-dir dance as the sidecar so
+// the mapping survives a crash if it survives the rename.
 func (s *Store) writeIdem(namespace, key, id string) error {
 	dir := filepath.Join(s.nsDir(namespace), ".idem")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -132,8 +143,21 @@ func (s *Store) writeIdem(namespace, key, id string) error {
 	}
 	final := s.idemPath(namespace, key)
 	tmp := final + ".tmp"
-	if err := os.WriteFile(tmp, []byte(id), 0o600); err != nil {
+
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open idem tmp: %w", err)
+	}
+	if _, err := f.Write([]byte(id)); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("write idem tmp: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("fsync idem tmp: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close idem tmp: %w", err)
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		return fmt.Errorf("rename idem: %w", err)
@@ -205,12 +229,23 @@ func (s *Store) AppendChunk(namespace, id string, src io.Reader, limit int64) (i
 	limited := io.LimitReader(src, limit)
 	n, copyErr := io.Copy(f, limited)
 	// Always fsync what made it to disk, even on copy error, so the next
-	// HEAD reflects reality. Treat fsync EIO as fatal: we surface the error
-	// and let the handler return 500. Per fsyncgate, retrying is unsafe.
-	if syncErr := f.Sync(); syncErr != nil && copyErr == nil {
+	// HEAD reflects reality. Treat fsync EIO as fatal: we surface the
+	// error and let the handler return 500. Per fsyncgate, retrying is
+	// unsafe.
+	syncErr := f.Sync()
+	if copyErr != nil {
+		// Prefer the copy error since it's more actionable, but log the
+		// fsync failure so we don't lose it silently.
+		if syncErr != nil {
+			// Combine into a single error for visibility upstream.
+			return n, fmt.Errorf("io.Copy: %w (also fsync partial: %v)", copyErr, syncErr)
+		}
+		return n, copyErr
+	}
+	if syncErr != nil {
 		return n, fmt.Errorf("fsync partial: %w", syncErr)
 	}
-	return n, copyErr
+	return n, nil
 }
 
 // Complete marks the upload as done: fsync the .partial, atomic-rename
@@ -265,7 +300,9 @@ func (s *Store) Delete(namespace, id string) error {
 		}
 	}
 	if infoErr == nil && info.IdempotencyKey != "" {
-		_ = os.Remove(s.idemPath(namespace, info.IdempotencyKey))
+		if err := os.Remove(s.idemPath(namespace, info.IdempotencyKey)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove idem mapping: %w", err)
+		}
 	}
 	return fsyncDir(s.nsDir(namespace))
 }

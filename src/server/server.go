@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -15,7 +17,9 @@ type Server struct {
 	auth   *Authenticator
 	store  *Store
 	logger *slog.Logger
-	addr   string // resolved listen addr after Run starts (testing aid)
+
+	mu   sync.Mutex
+	addr string // resolved listen addr (set on first Run)
 }
 
 // New constructs a Server from cfg + tokens path. Logger defaults to a JSON
@@ -58,17 +62,23 @@ func (s *Server) Run(ctx context.Context, version string) error {
 		Version:       version,
 		Logger:        s.logger,
 	})
+	listener, err := net.Listen("tcp", s.cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", s.cfg.ListenAddr, err)
+	}
+	s.mu.Lock()
+	s.addr = listener.Addr().String()
+	s.mu.Unlock()
+
 	srv := &http.Server{
-		Addr:              s.cfg.ListenAddr,
 		Handler:           h.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	s.addr = srv.Addr
 
 	errCh := make(chan error, 1)
 	go func() {
-		s.logger.Info("ferry listen", "addr", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		s.logger.Info("ferry listen", "addr", listener.Addr().String())
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}
@@ -87,4 +97,12 @@ func (s *Server) Run(ctx context.Context, version string) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// Addr returns the resolved listening address. Empty until Run starts.
+// Useful for tests that bind ":0" to get an ephemeral port.
+func (s *Server) Addr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.addr
 }
