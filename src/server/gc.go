@@ -131,8 +131,10 @@ func (g *GC) sweepNamespace(ctx context.Context, ns string, now time.Time) {
 }
 
 // maybeSweepUpload returns true when the upload was removed and false when
-// it was kept (still in retention window or currently locked).
-func (g *GC) maybeSweepUpload(ctx context.Context, ns, id string, now time.Time) bool {
+// it was kept (still in retention window or currently locked). ctx is
+// unused after the switch to TryAcquire (no more lock-acquire deadline)
+// but we keep the parameter for symmetry with sweepNamespace's loop.
+func (g *GC) maybeSweepUpload(_ context.Context, ns, id string, now time.Time) bool {
 	info, err := g.cfg.Store.LoadInfo(ns, id)
 	if err != nil {
 		// .info was racing-removed by Delete; nothing to do.
