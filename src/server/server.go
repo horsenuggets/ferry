@@ -36,6 +36,9 @@ func New(cfg *Config, version string, logger *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init store: %w", err)
 	}
+	// Route the store's structured timing logs through the same logger
+	// the rest of the server uses (JSON to stderr in production).
+	store.SetLogger(logger)
 	_ = version // currently surfaced via NewHandler below
 	return &Server{
 		cfg:    cfg,

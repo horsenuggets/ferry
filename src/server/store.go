@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,17 +36,52 @@ type Info struct {
 //	<root>/<namespace>/<id>.info      - sidecar JSON
 //	<root>/<namespace>/.idem/<key>    - idempotency-key -> id mapping
 type Store struct {
-	root string
+	root   string
+	logger *slog.Logger
 }
 
 // NewStore constructs a Store rooted at root, creating the root directory
 // (and any missing parents) if needed. Namespace subdirs are created
-// lazily on first Create.
+// lazily on first Create. The store logs structured timing events to
+// slog.Default(); use SetLogger to override.
 func NewStore(root string) (*Store, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir data root: %w", err)
 	}
-	return &Store{root: root}, nil
+	return &Store{root: root, logger: slog.Default()}, nil
+}
+
+// SetLogger overrides the slog.Logger used for the store's structured
+// timing events. A nil logger falls back to slog.Default.
+func (s *Store) SetLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	s.logger = logger
+}
+
+// timed runs fn, measures its wall-clock duration, and emits a structured
+// slog event named "ferry.<op>" with the supplied attrs plus an "elapsed"
+// duration. Failures are logged at WARN with the error stringified;
+// successes are logged at INFO.
+func (s *Store) timed(ctx context.Context, op string, attrs []slog.Attr, fn func() error) error {
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	start := time.Now()
+	err := fn()
+	elapsed := time.Since(start)
+	out := make([]slog.Attr, 0, len(attrs)+2)
+	out = append(out, attrs...)
+	out = append(out, slog.Duration("elapsed", elapsed))
+	if err != nil {
+		out = append(out, slog.String("error", err.Error()))
+		logger.LogAttrs(ctx, slog.LevelWarn, "ferry."+op, out...)
+		return err
+	}
+	logger.LogAttrs(ctx, slog.LevelInfo, "ferry."+op, out...)
+	return nil
 }
 
 // nsDir returns the namespace directory path.
@@ -215,8 +252,11 @@ func (s *Store) CurrentOffset(namespace, id string) (int64, error) {
 // AppendChunk opens the .partial in append mode, copies up to limit bytes
 // from src, fsyncs, and returns bytes written. err includes early src errors
 // (e.g., context cancel mid-read); n reflects what made it to disk before
-// the error.
-func (s *Store) AppendChunk(namespace, id string, src io.Reader, limit int64) (int64, error) {
+// the error. isFinal is a hint from the caller indicating whether this
+// PATCH is sized to finish the upload; it is recorded on the structured
+// timing logs so operators can correlate per-chunk durations against the
+// final-vs-intermediate PATCH.
+func (s *Store) AppendChunk(ctx context.Context, namespace, id string, src io.Reader, limit int64, isFinal bool) (int64, error) {
 	path := s.partialPath(namespace, id)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -227,13 +267,43 @@ func (s *Store) AppendChunk(namespace, id string, src io.Reader, limit int64) (i
 	}
 	defer f.Close()
 
+	baseAttrs := []slog.Attr{
+		slog.String("upload_id", id),
+		slog.String("namespace", namespace),
+		slog.Bool("is_final", isFinal),
+	}
+
 	limited := io.LimitReader(src, limit)
-	n, copyErr := io.Copy(f, limited)
+	var n int64
+	var copyErr error
+	_ = s.timed(ctx, "chunk_write", baseAttrs, func() error {
+		n, copyErr = io.Copy(f, limited)
+		// Surface only fatal opener-style errors here; the io.Copy error
+		// is forwarded through copyErr and reported by the caller. We
+		// still want a non-nil return to flip the entry to WARN if the
+		// copy fundamentally failed.
+		if copyErr != nil && !errors.Is(copyErr, io.EOF) {
+			return copyErr
+		}
+		return nil
+	})
+	// Annotate with the byte count we actually moved.
+	s.logger.LogAttrs(ctx, slog.LevelDebug, "ferry.chunk_write.bytes",
+		slog.String("upload_id", id),
+		slog.String("namespace", namespace),
+		slog.Bool("is_final", isFinal),
+		slog.Int64("bytes", n),
+	)
+
 	// Always fsync what made it to disk, even on copy error, so the next
 	// HEAD reflects reality. Treat fsync EIO as fatal: we surface the
 	// error and let the handler return 500. Per fsyncgate, retrying is
 	// unsafe.
-	syncErr := f.Sync()
+	var syncErr error
+	_ = s.timed(ctx, "chunk_fsync", append(baseAttrs, slog.Int64("bytes", n)), func() error {
+		syncErr = f.Sync()
+		return syncErr
+	})
 	if copyErr != nil {
 		// Prefer the copy error since it's more actionable, but log the
 		// fsync failure so we don't lose it silently.
@@ -251,37 +321,142 @@ func (s *Store) AppendChunk(namespace, id string, src io.Reader, limit int64) (i
 
 // Complete marks the upload as done: fsync the .partial, atomic-rename
 // .partial -> id, fsync parent dir, then update the sidecar with
-// completed_at.
-func (s *Store) Complete(namespace, id string) error {
+// completed_at. Each discrete I/O step is wrapped in a structured slog
+// timing event ("ferry.partial_rename", "ferry.parent_dir_fsync", etc.)
+// so operators can break down where the final PATCH spends its wall
+// clock. A summary "ferry.upload_complete" entry covers the whole call.
+func (s *Store) Complete(ctx context.Context, namespace, id string) error {
 	dir := s.nsDir(namespace)
 	partial := s.partialPath(namespace, id)
 	final := s.completedPath(namespace, id)
+	infoFinal := s.infoPath(namespace, id)
+	infoTmp := infoFinal + ".tmp"
+
+	baseAttrs := []slog.Attr{
+		slog.String("upload_id", id),
+		slog.String("namespace", namespace),
+	}
+
+	overallStart := time.Now()
+	logSummary := func(err error, totalBytes int64) {
+		attrs := append([]slog.Attr{}, baseAttrs...)
+		attrs = append(attrs,
+			slog.Int64("bytes", totalBytes),
+			slog.Duration("elapsed", time.Since(overallStart)),
+		)
+		level := slog.LevelInfo
+		if err != nil {
+			attrs = append(attrs, slog.String("error", err.Error()))
+			level = slog.LevelWarn
+		}
+		s.logger.LogAttrs(ctx, level, "ferry.upload_complete", attrs...)
+	}
 
 	// fsync the data file before rename.
-	f, err := os.OpenFile(partial, os.O_RDONLY, 0)
-	if err != nil {
+	var totalBytes int64
+	var pf *os.File
+	if err := s.timed(ctx, "partial_open", baseAttrs, func() error {
+		var oerr error
+		pf, oerr = os.OpenFile(partial, os.O_RDONLY, 0)
+		if oerr != nil {
+			return oerr
+		}
+		if st, serr := pf.Stat(); serr == nil {
+			totalBytes = st.Size()
+		}
+		return nil
+	}); err != nil {
+		logSummary(err, totalBytes)
 		return fmt.Errorf("open partial for fsync: %w", err)
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
+	if err := s.timed(ctx, "partial_fsync", append(baseAttrs, slog.Int64("bytes", totalBytes)), func() error {
+		return pf.Sync()
+	}); err != nil {
+		_ = pf.Close()
+		logSummary(err, totalBytes)
 		return fmt.Errorf("fsync partial: %w", err)
 	}
-	if err := f.Close(); err != nil {
+	if err := pf.Close(); err != nil {
+		logSummary(err, totalBytes)
 		return fmt.Errorf("close partial: %w", err)
 	}
-	if err := os.Rename(partial, final); err != nil {
+	if err := s.timed(ctx, "partial_rename", baseAttrs, func() error {
+		return os.Rename(partial, final)
+	}); err != nil {
+		logSummary(err, totalBytes)
 		return fmt.Errorf("rename completed: %w", err)
 	}
-	if err := fsyncDir(dir); err != nil {
+	if err := s.timed(ctx, "parent_dir_fsync", baseAttrs, func() error {
+		return fsyncDir(dir)
+	}); err != nil {
+		logSummary(err, totalBytes)
 		return err
 	}
-	info, err := s.LoadInfo(namespace, id)
-	if err != nil {
+
+	// Load the existing sidecar so we can stamp completed_at.
+	var info Info
+	if err := s.timed(ctx, "info_load", baseAttrs, func() error {
+		var lerr error
+		info, lerr = s.LoadInfo(namespace, id)
+		return lerr
+	}); err != nil {
+		logSummary(err, totalBytes)
 		return err
 	}
 	now := time.Now().UTC()
 	info.CompletedAt = &now
-	return s.writeInfo(info)
+
+	b, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		logSummary(err, totalBytes)
+		return fmt.Errorf("marshal info: %w", err)
+	}
+
+	// Write the .info.tmp, fsync it, rename it, and fsync the parent dir.
+	// Each step is a separate timed entry so operators can pinpoint which
+	// of the two fsyncs in the completion path dominates wall clock.
+	var tmpFile *os.File
+	if err := s.timed(ctx, "info_completed_write", append(baseAttrs, slog.Int("bytes", len(b))), func() error {
+		f, oerr := os.OpenFile(infoTmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if oerr != nil {
+			return fmt.Errorf("open info tmp: %w", oerr)
+		}
+		if _, werr := f.Write(b); werr != nil {
+			_ = f.Close()
+			return fmt.Errorf("write info tmp: %w", werr)
+		}
+		tmpFile = f
+		return nil
+	}); err != nil {
+		logSummary(err, totalBytes)
+		return err
+	}
+	if err := s.timed(ctx, "info_completed_fsync", baseAttrs, func() error {
+		return tmpFile.Sync()
+	}); err != nil {
+		_ = tmpFile.Close()
+		logSummary(err, totalBytes)
+		return fmt.Errorf("fsync info tmp: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		logSummary(err, totalBytes)
+		return fmt.Errorf("close info tmp: %w", err)
+	}
+	if err := s.timed(ctx, "info_completed_rename", baseAttrs, func() error {
+		return os.Rename(infoTmp, infoFinal)
+	}); err != nil {
+		logSummary(err, totalBytes)
+		return fmt.Errorf("rename info: %w", err)
+	}
+	if err := s.timed(ctx, "info_completed_dir_fsync", baseAttrs, func() error {
+		return fsyncDir(dir)
+	}); err != nil {
+		logSummary(err, totalBytes)
+		return err
+	}
+
+	logSummary(nil, totalBytes)
+	return nil
 }
 
 // Delete removes the partial/completed binary, the sidecar, and the idem
