@@ -38,7 +38,7 @@ func TestLoadConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	body := `{"listen_addr":"127.0.0.1:7421","data_dir":"` + dir + `/data","tokens_path":"` + dir + `/tokens.json"}`
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := LoadConfig(path)
@@ -62,7 +62,7 @@ func TestLoadConfigMissing(t *testing.T) {
 func TestLoadConfigBadJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.json")
-	if err := os.WriteFile(path, []byte("not json"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadConfig(path); err == nil {

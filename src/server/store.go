@@ -132,7 +132,7 @@ func (s *Store) writeIdem(namespace, key, id string) error {
 	}
 	final := s.idemPath(namespace, key)
 	tmp := final + ".tmp"
-	if err := os.WriteFile(tmp, []byte(id), 0o644); err != nil {
+	if err := os.WriteFile(tmp, []byte(id), 0o600); err != nil {
 		return fmt.Errorf("write idem tmp: %w", err)
 	}
 	if err := os.Rename(tmp, final); err != nil {

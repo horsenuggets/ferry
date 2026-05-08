@@ -53,7 +53,7 @@ func contextWithCause(parent context.Context) (context.Context, context.CancelCa
 }
 
 // ctxReader wraps an io.Reader with a context check before each Read call.
-// When the context is cancelled (e.g. cooperative-cancel from the locker),
+// When the context is canceled (e.g. cooperative-cancel from the locker),
 // Read returns ctx.Err() so the in-flight io.Copy unblocks promptly.
 type ctxReader struct {
 	ctx context.Context

@@ -267,7 +267,7 @@ func (h *Handler) patchUpload(w http.ResponseWriter, r *http.Request, namespace,
 	n, copyErr := h.store.AppendChunk(namespace, id, cr, limit+1)
 	newOffset := currentOffset + n
 
-	// If the body was trimmed/cancelled mid-flight (peer hung up, we got
+	// If the body was trimmed/canceled mid-flight (peer hung up, we got
 	// ousted by another acquirer), persist what we have and return - the
 	// next request resumes from on-disk size. We do NOT 500 in that case.
 	if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, context.Canceled) {

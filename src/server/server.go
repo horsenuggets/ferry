@@ -41,7 +41,7 @@ func New(cfg *Config, version string, logger *slog.Logger) (*Server, error) {
 	}, nil
 }
 
-// Run starts the HTTP server and blocks until ctx is cancelled, then drains
+// Run starts the HTTP server and blocks until ctx is canceled, then drains
 // in-flight requests up to 10s before returning.
 //
 // TODO(phase 4): GC sweeper for completed/incomplete uploads beyond their

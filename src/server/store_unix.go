@@ -14,7 +14,12 @@ func availableBytes(root string) (int64, error) {
 	if err := unix.Statfs(root, &fs); err != nil {
 		return 0, fmt.Errorf("statfs: %w", err)
 	}
-	// Bavail/Bsize are unsigned; the product fits in int64 for any sane
-	// filesystem.
-	return int64(fs.Bavail) * int64(fs.Bsize), nil
+	// Bavail/Bsize are unsigned. Cap the product at maxInt64 to avoid an
+	// uint64 -> int64 overflow on absurdly-large filesystems (gosec G115).
+	const maxInt64 = int64(^uint64(0) >> 1)
+	avail := uint64(fs.Bavail) * uint64(fs.Bsize)
+	if avail > uint64(maxInt64) {
+		return maxInt64, nil
+	}
+	return int64(avail), nil
 }
