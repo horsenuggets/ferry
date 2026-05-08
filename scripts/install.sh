@@ -55,7 +55,11 @@ if [[ $DRY_RUN -eq 0 && $(id -u) -ne 0 ]]; then
     [[ -n "$BINARY" ]] && args+=(--binary "$BINARY")
     [[ $CONFIG_ONLY -eq 1 ]] && args+=(--config-only)
     args+=(--prefix "$PREFIX")
-    exec sudo -E env PATH="$PATH" bash "$0" "${args[@]}"
+    # Use an absolute shell path and let sudo reset PATH to a sane default.
+    # Trusting the caller's PATH when escalating to root is a known foot-gun:
+    # a writable directory earlier in PATH could shadow `bash` or downstream
+    # tools (`useradd`, `systemctl`, ...) with attacker-controlled binaries.
+    exec sudo /bin/bash "$0" "${args[@]}"
 fi
 
 # Detect target arch.
@@ -118,6 +122,21 @@ ensure_user() {
 
 ensure_dir() {
     # ensure_dir <path> <mode> <owner>
+    #
+    # Creates the directory (with the given mode + owner) if missing. If it
+    # already exists we leave its mode/ownership alone - we don't want to
+    # silently chown system dirs like /usr/local/bin that we just happen to
+    # cross during install.
+    local path="$1" mode="$2" owner="$3"
+    if [[ -d "$path" ]]; then
+        return
+    fi
+    run install -d -m "$mode" -o "${owner%:*}" -g "${owner#*:}" "$path"
+}
+
+# enforce_dir is for ferry-owned directories where we DO want to converge
+# to the target mode + owner on every run (e.g. /etc/ferry, /var/lib/ferry).
+enforce_dir() {
     local path="$1" mode="$2" owner="$3"
     if [[ -d "$path" ]]; then
         run chown "$owner" "$path"
@@ -131,16 +150,22 @@ echo "ferry install: arch=$ARCH dry_run=$DRY_RUN config_only=$CONFIG_ONLY prefix
 
 ensure_user
 
+# Resolve the final binary location regardless of whether we're installing
+# the binary or just the service. The systemd unit's ExecStart is templated
+# to point at this path, so a non-default --prefix produces a unit that
+# matches.
+BIN_DST="$PREFIX/bin/ferry"
+
 if [[ $CONFIG_ONLY -eq 0 ]]; then
-    BIN_DST="$PREFIX/bin/ferry"
     echo "ferry install: would install $BINARY -> $BIN_DST"
+    ensure_dir "$PREFIX/bin" 0755 root:root
     run install -m 0755 -o root -g root "$BINARY" "$BIN_DST"
 fi
 
-ensure_dir /etc/ferry           0750 root:ferry
-ensure_dir /var/lib/ferry       0750 ferry:ferry
-ensure_dir /var/lib/ferry/data  0750 ferry:ferry
-ensure_dir /var/log/ferry       0750 ferry:ferry
+enforce_dir /etc/ferry           0750 root:ferry
+enforce_dir /var/lib/ferry       0750 ferry:ferry
+enforce_dir /var/lib/ferry/data  0750 ferry:ferry
+enforce_dir /var/log/ferry       0750 ferry:ferry
 
 # Default config: only written when missing.
 if [[ ! -f /etc/ferry/config.json ]]; then
@@ -174,24 +199,48 @@ else
     echo "tokens /etc/ferry/tokens.json already present, leaving alone"
 fi
 
-# Install the systemd unit.
+# Install the systemd unit. The unit template ships with a @@FERRY_BIN@@
+# placeholder so a non-default --prefix produces a working ExecStart.
 UNIT_SRC="$REPO_ROOT/systemd/ferry.service"
 UNIT_DST="/etc/systemd/system/ferry.service"
 if [[ ! -f "$UNIT_SRC" ]]; then
     echo "missing $UNIT_SRC; expected systemd/ferry.service in repo" >&2
     exit 1
 fi
-echo "ferry install: would install $UNIT_SRC -> $UNIT_DST"
-run install -m 0644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
+echo "ferry install: would install $UNIT_SRC -> $UNIT_DST (ExecStart=$BIN_DST listen ...)"
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "would substitute @@FERRY_BIN@@ -> $BIN_DST in $UNIT_DST"
+else
+    # sed escape: BIN_DST may contain '/'; use '|' as the delimiter.
+    sed "s|@@FERRY_BIN@@|$BIN_DST|g" "$UNIT_SRC" >"$UNIT_DST.tmp"
+    install -m 0644 -o root -g root "$UNIT_DST.tmp" "$UNIT_DST"
+    rm -f "$UNIT_DST.tmp"
+fi
 
 run systemctl daemon-reload
-run systemctl enable ferry
 
-# Restart if already running, otherwise start.
-if [[ $DRY_RUN -eq 0 ]] && systemctl is-active --quiet ferry; then
-    run systemctl restart ferry
+# Only enable + (re)start the service when we know the binary at the unit's
+# ExecStart path is in place. Cases where it isn't:
+#  - `--config-only` was passed and the binary was never copied here
+#  - real install but the binary was missing for some other reason
+# In either case starting now would just fail and leave the installer
+# non-zero after partial setup; admin can re-run once the binary is there.
+should_start=1
+if [[ $CONFIG_ONLY -eq 1 ]]; then
+    should_start=0
+elif [[ $DRY_RUN -eq 0 && ! -x "$BIN_DST" ]]; then
+    should_start=0
+fi
+
+if [[ $should_start -eq 1 ]]; then
+    run systemctl enable ferry
+    if [[ $DRY_RUN -eq 0 ]] && systemctl is-active --quiet ferry; then
+        run systemctl restart ferry
+    else
+        run systemctl start ferry
+    fi
 else
-    run systemctl start ferry
+    echo "ferry install: skipping systemctl enable/start (binary not present at $BIN_DST or --config-only set; re-run installer once the binary is in place)"
 fi
 
 echo

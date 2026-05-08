@@ -35,22 +35,41 @@ if [[ $DRY_RUN -eq 0 && $(id -u) -ne 0 ]]; then
     args=()
     [[ $PURGE -eq 1 ]] && args+=(--purge)
     args+=(--prefix "$PREFIX")
-    exec sudo -E env PATH="$PATH" bash "$0" "${args[@]}"
+    # Absolute shell path, no -E / no PATH propagation: see the same comment
+    # in scripts/install.sh.
+    exec sudo /bin/bash "$0" "${args[@]}"
 fi
 
 run() {
+    # Surface failures: anything that isn't expected to be flaky goes through
+    # this and propagates non-zero so a half-uninstalled system isn't reported
+    # as success.
     if [[ $DRY_RUN -eq 1 ]]; then
         echo "would run: $*"
     else
-        "$@" || true
+        "$@"
+    fi
+}
+
+run_optional() {
+    # For commands where "not present" is a valid state - e.g.
+    # `systemctl stop` on a service that isn't running, or `systemctl
+    # disable` on a service that isn't enabled. We log but don't bail.
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "would run (optional): $*"
+    else
+        "$@" || echo "  (ignored failure of: $*)"
     fi
 }
 
 echo "ferry uninstall: dry_run=$DRY_RUN purge=$PURGE prefix=$PREFIX"
 
-# Stop + disable. Both ignore "not running / not enabled" errors.
-run systemctl stop ferry
-run systemctl disable ferry
+# Stop + disable: optional because "already stopped / not enabled" is fine
+# and shouldn't fail an idempotent uninstall. Other steps below use `run`
+# so genuine failures (e.g., userdel refusing because of running processes)
+# bubble up.
+run_optional systemctl stop ferry
+run_optional systemctl disable ferry
 
 UNIT_DST="/etc/systemd/system/ferry.service"
 if [[ -f "$UNIT_DST" || $DRY_RUN -eq 1 ]]; then
