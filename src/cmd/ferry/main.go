@@ -8,7 +8,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/horsenuggets/ferry/internal/version"
+	"github.com/horsenuggets/ferry/src/version"
 )
 
 const usage = `ferry - fault-tolerant chunked file uploader

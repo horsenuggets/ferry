@@ -14,20 +14,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
-      - name: gofmt
-        run: |
-          out=$(gofmt -l .)
-          if [ -n "$out" ]; then
-            echo "gofmt found issues:"
-            echo "$out"
-            exit 1
-          fi
-      - name: go vet
-        run: go vet ./...
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v6
         with:
           version: v1.62
+          args: --version
+      - name: lint
+        run: ./scripts/lint.sh
 
   test:
     runs-on: ubuntu-latest
@@ -36,8 +28,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
-      - name: go test
-        run: go test ./...
+      - name: test
+        run: ./scripts/test.sh
 
   build:
     runs-on: ubuntu-latest
@@ -47,7 +39,7 @@ jobs:
         with:
           go-version: "1.23"
       - name: cross-compile
-        run: make cross
+        run: ./scripts/cross.sh
       - name: smoke test linux-amd64
         run: ./dist/ferry-linux-amd64 --help
       - name: upload artifacts
