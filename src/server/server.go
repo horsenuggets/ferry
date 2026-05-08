@@ -74,7 +74,7 @@ func (s *Server) Run(ctx context.Context, version string) error {
 		IncompleteTTL: incompleteTTL,
 		Logger:        s.logger,
 	})
-	go gc.Run(ctx)
+
 	listener, err := net.Listen("tcp", s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.cfg.ListenAddr, err)
@@ -82,6 +82,13 @@ func (s *Server) Run(ctx context.Context, version string) error {
 	s.mu.Lock()
 	s.addr = listener.Addr().String()
 	s.mu.Unlock()
+
+	// Only start the GC goroutine once Listen has succeeded - otherwise
+	// an early-return error path here leaks the goroutine until the
+	// caller's ctx is canceled (which in tests may never happen).
+	gcCtx, cancelGC := context.WithCancel(ctx)
+	defer cancelGC()
+	go gc.Run(gcCtx)
 
 	srv := &http.Server{
 		Handler:           h.Routes(),

@@ -91,3 +91,22 @@ func TestLockerAcquireTimeout(t *testing.T) {
 		t.Errorf("Acquire on held lock = %v, want ErrFileLocked or DeadlineExceeded", err)
 	}
 }
+
+func TestLockerTryAcquire(t *testing.T) {
+	l := NewLocker()
+	rel, ok := l.TryAcquire("ns/upload-1")
+	if !ok {
+		t.Fatalf("TryAcquire on empty should succeed")
+	}
+	// Second TryAcquire while held: must fail without disturbing the holder.
+	if _, ok := l.TryAcquire("ns/upload-1"); ok {
+		t.Fatalf("TryAcquire on held lock should return false")
+	}
+	rel()
+	// After release, TryAcquire works again.
+	rel2, ok := l.TryAcquire("ns/upload-1")
+	if !ok {
+		t.Fatalf("TryAcquire after release should succeed")
+	}
+	rel2()
+}

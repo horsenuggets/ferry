@@ -316,10 +316,21 @@ func (s *Store) AvailableBytes() (int64, error) {
 
 // Truncate trims the .partial file back to size bytes. Used by checksum
 // mismatch handling to roll a failed PATCH off disk so the next attempt
-// resumes from the previous offset.
+// resumes from the previous offset. fsyncs the file after the truncate so
+// the rollback survives a crash; otherwise we could respond 460 to the
+// client and then come back up still holding the bad bytes.
 func (s *Store) Truncate(namespace, id string, size int64) error {
-	if err := os.Truncate(s.partialPath(namespace, id), size); err != nil {
+	path := s.partialPath(namespace, id)
+	if err := os.Truncate(path, size); err != nil {
 		return fmt.Errorf("truncate partial: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open partial after truncate: %w", err)
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("fsync after truncate: %w", err)
 	}
 	return nil
 }
@@ -363,16 +374,33 @@ func (s *Store) ListUploads(namespace string) ([]string, error) {
 	return out, nil
 }
 
-// HasPartial reports whether a .partial exists for the upload.
-func (s *Store) HasPartial(namespace, id string) bool {
+// HasPartial reports whether a .partial exists for the upload. Returns
+// (exists, err); a non-nil err means the answer is unknown (typically
+// permission/IO error). Callers that can't tolerate "unknown" - e.g. the
+// GC sweeper deciding whether to delete a sidecar - should err on the side
+// of keeping the upload.
+func (s *Store) HasPartial(namespace, id string) (bool, error) {
 	_, err := os.Stat(s.partialPath(namespace, id))
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("stat partial: %w", err)
 }
 
 // HasCompleted reports whether the completed (post-rename) file exists.
-func (s *Store) HasCompleted(namespace, id string) bool {
+// Same (bool, error) semantics as HasPartial.
+func (s *Store) HasCompleted(namespace, id string) (bool, error) {
 	_, err := os.Stat(s.completedPath(namespace, id))
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("stat completed: %w", err)
 }
 
 // ListIdemKeys enumerates idempotency-key entries in the namespace's .idem

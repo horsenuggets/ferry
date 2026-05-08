@@ -61,7 +61,7 @@ func TestGC_RemovesOldCompletedUpload(t *testing.T) {
 
 	gc.SweepOnce(context.Background())
 
-	if store.HasCompleted("ns", "old-completed") {
+	if ok, _ := store.HasCompleted("ns", "old-completed"); ok {
 		t.Fatalf("expected old completed file to be gone")
 	}
 	if _, err := store.LoadInfo("ns", "old-completed"); err == nil {
@@ -94,7 +94,7 @@ func TestGC_KeepsFreshCompletedUpload(t *testing.T) {
 
 	gc.SweepOnce(context.Background())
 
-	if !store.HasCompleted("ns", "fresh-completed") {
+	if ok, _ := store.HasCompleted("ns", "fresh-completed"); !ok {
 		t.Fatalf("expected fresh completed file to remain")
 	}
 }
@@ -116,7 +116,7 @@ func TestGC_RemovesIncompleteUploadPastExpiry(t *testing.T) {
 
 	gc.SweepOnce(context.Background())
 
-	if store.HasPartial("ns", "stale-incomplete") {
+	if ok, _ := store.HasPartial("ns", "stale-incomplete"); ok {
 		t.Fatalf("expected stale partial to be gone")
 	}
 }
@@ -137,7 +137,7 @@ func TestGC_KeepsInProgressUpload(t *testing.T) {
 
 	gc.SweepOnce(context.Background())
 
-	if !store.HasPartial("ns", "fresh-incomplete") {
+	if ok, _ := store.HasPartial("ns", "fresh-incomplete"); !ok {
 		t.Fatalf("expected fresh partial to remain")
 	}
 }
@@ -173,14 +173,14 @@ func TestGC_SkipsLockedUpload(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("SweepOnce should have returned promptly when lock is held")
 	}
-	if !store.HasPartial("ns", "locked-incomplete") {
+	if ok, _ := store.HasPartial("ns", "locked-incomplete"); !ok {
 		t.Fatalf("expected locked partial to remain")
 	}
 	releaseHandler()
 
 	// After releasing, a fresh sweep should now reap it.
 	gc.SweepOnce(context.Background())
-	if store.HasPartial("ns", "locked-incomplete") {
+	if ok, _ := store.HasPartial("ns", "locked-incomplete"); ok {
 		t.Fatalf("expected locked-incomplete to be reaped after lock release")
 	}
 }

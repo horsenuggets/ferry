@@ -70,6 +70,29 @@ func (l *Locker) Acquire(ctx context.Context, key string, requestRelease func())
 	}
 }
 
+// TryAcquire attempts to take the lock without disturbing any existing
+// holder. Returns the release function and true on success; nil + false
+// if the lock is currently held by someone else. Used by the GC sweeper
+// so background reaping never cancels an in-flight PATCH.
+func (l *Locker) TryAcquire(key string) (func(), bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, held := l.locks[key]; held {
+		return nil, false
+	}
+	released := make(chan struct{})
+	l.locks[key] = lockEntry{
+		released: released,
+		// requestRelease intentionally a no-op: a future Acquire that
+		// asks the holder to release would call this. Since the GC
+		// holder won't honor the signal anyway (it can't cancel a
+		// disk-deletion midway), we just no-op and let Acquire's
+		// timeout handle the contention.
+		requestRelease: func() {},
+	}
+	return func() { l.release(key, released) }, true
+}
+
 func (l *Locker) release(key string, released chan struct{}) {
 	l.mu.Lock()
 	delete(l.locks, key)

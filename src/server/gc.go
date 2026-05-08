@@ -35,10 +35,22 @@ type GC struct {
 	cfg GCConfig
 }
 
-// NewGC constructs a GC sweeper.
+// minGCInterval is the smallest tick we accept; anything below produces
+// CPU thrash with no useful churn-rate. Misconfigurations get clamped here
+// instead of panicking time.NewTicker.
+const minGCInterval = time.Second
+
+// NewGC constructs a GC sweeper. Interval is clamped to a minimum so a
+// misconfigured (or zero/negative) gc_interval_seconds doesn't panic the
+// server at runtime.
 func NewGC(cfg GCConfig) *GC {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.Interval < minGCInterval {
+		cfg.Logger.Warn("gc: interval too small, clamping",
+			"requested", cfg.Interval, "clamped_to", minGCInterval)
+		cfg.Interval = minGCInterval
 	}
 	return &GC{cfg: cfg}
 }
@@ -131,8 +143,18 @@ func (g *GC) maybeSweepUpload(ctx context.Context, ns, id string, now time.Time)
 		return false
 	}
 
-	hasPartial := g.cfg.Store.HasPartial(ns, id)
-	hasCompleted := g.cfg.Store.HasCompleted(ns, id)
+	hasPartial, errP := g.cfg.Store.HasPartial(ns, id)
+	if errP != nil {
+		g.cfg.Logger.Warn("gc: stat partial; keeping upload",
+			"namespace", ns, "id", id, "err", errP)
+		return false
+	}
+	hasCompleted, errC := g.cfg.Store.HasCompleted(ns, id)
+	if errC != nil {
+		g.cfg.Logger.Warn("gc: stat completed; keeping upload",
+			"namespace", ns, "id", id, "err", errC)
+		return false
+	}
 
 	// Decide whether this upload should be reaped.
 	var reason string
@@ -151,13 +173,14 @@ func (g *GC) maybeSweepUpload(ctx context.Context, ns, id string, now time.Time)
 		return false
 	}
 
-	// Try to take the upload's lock with a tight deadline. If a PATCH or
-	// other request is holding it, skip this round - we'll get it next
-	// sweep.
-	lockCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer cancel()
-	release, err := g.cfg.Locker.Acquire(lockCtx, ns+"/"+id, func() {})
-	if err != nil {
+	// Take the upload's lock without disturbing any current holder. If a
+	// PATCH (or another GC pass) is holding it, skip this round and try
+	// again next sweep. Using TryAcquire instead of Acquire is important:
+	// Acquire would call the holder's requestRelease, which in production
+	// cancels the in-flight PATCH. We never want background reaping to
+	// abort active uploads.
+	release, ok := g.cfg.Locker.TryAcquire(ns + "/" + id)
+	if !ok {
 		g.cfg.Logger.Info("gc: skipped (locked)", "namespace", ns, "id", id)
 		return false
 	}

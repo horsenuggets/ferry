@@ -30,30 +30,32 @@ func parseUploadChecksum(header string) ([]byte, hash.Hash, error) {
 	}
 	parts := strings.SplitN(header, " ", 2)
 	if len(parts) != 2 {
-		return nil, nil, ErrUnsupportedChecksumAlgo
+		return nil, nil, ErrInvalidChecksumHeader
 	}
 	algo := strings.ToLower(strings.TrimSpace(parts[0]))
 	digestHex := strings.TrimSpace(parts[1])
 
-	expected, err := hex.DecodeString(digestHex)
-	if err != nil {
-		return nil, nil, ErrUnsupportedChecksumAlgo
-	}
-
+	// Resolve the algorithm first so a malformed digest under a known algo
+	// can be reported as "invalid header" rather than "unsupported algo".
 	var hasher hash.Hash
+	var wantSize int
 	switch algo {
 	case "crc32c":
 		hasher = crc32.New(crc32cTable)
-		if len(expected) != crc32.Size {
-			return nil, nil, ErrUnsupportedChecksumAlgo
-		}
+		wantSize = crc32.Size
 	case "sha256":
 		hasher = sha256.New()
-		if len(expected) != sha256.Size {
-			return nil, nil, ErrUnsupportedChecksumAlgo
-		}
+		wantSize = sha256.Size
 	default:
 		return nil, nil, ErrUnsupportedChecksumAlgo
+	}
+
+	expected, err := hex.DecodeString(digestHex)
+	if err != nil {
+		return nil, nil, ErrInvalidChecksumHeader
+	}
+	if len(expected) != wantSize {
+		return nil, nil, ErrInvalidChecksumHeader
 	}
 	return expected, hasher, nil
 }
