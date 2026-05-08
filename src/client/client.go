@@ -309,7 +309,10 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 		// the body, so read the chunk into a buffer and hash it.
 		// chunkLen is bounded by the configured chunk size (default
 		// 4 MiB, max 64 MiB), so this is bounded memory.
-		var reqBody io.Reader = bodyR
+		// reqBody is what we hand to the http.Request. It's bodyR by default
+		// (stream from disk) but we replace it with a buffered copy below
+		// when we need to compute a checksum first.
+		var reqBody = bodyR
 		var cksumHeaderVal string
 		if algo != checksumAlgoNone {
 			buf := make([]byte, chunkLen)

@@ -9,11 +9,6 @@ import (
 	"strings"
 )
 
-// supportedChecksumAlgos is the canonical comma-separated list ferry
-// advertises. Order is intentional: clients pick the cheapest option (crc32c)
-// unless they have a reason to upgrade.
-const supportedChecksumAlgos = "crc32c,sha256"
-
 // crc32cTable is the Castagnoli polynomial used by tus and most modern
 // hardware-accelerated CRC32 implementations.
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)

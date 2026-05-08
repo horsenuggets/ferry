@@ -29,7 +29,7 @@ func gcFixture(t *testing.T) (*Store, *GC) {
 
 func writeBytes(t *testing.T, path string, b []byte) {
 	t.Helper()
-	if err := os.WriteFile(path, b, 0o644); err != nil {
+	if err := os.WriteFile(path, b, 0o600); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }
