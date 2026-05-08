@@ -1,10 +1,14 @@
 package client
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -15,17 +19,42 @@ import (
 	"github.com/cenkalti/backoff/v4"
 )
 
+// crc32cClientTable is the Castagnoli polynomial used by tus and ferry for
+// the crc32c algorithm. Module-level so we don't recompute it per chunk.
+var crc32cClientTable = crc32.MakeTable(crc32.Castagnoli)
+
+// computeChunkChecksum returns the Upload-Checksum header value
+// `<algo> <hex>` for the given chunk and algorithm.
+func computeChunkChecksum(algo string, chunk []byte) (string, error) {
+	switch algo {
+	case checksumAlgoCRC32C:
+		h := crc32.New(crc32cClientTable)
+		_, _ = h.Write(chunk)
+		return checksumAlgoCRC32C + " " + hex.EncodeToString(h.Sum(nil)), nil
+	case checksumAlgoSHA256:
+		h := sha256.New()
+		_, _ = h.Write(chunk)
+		return checksumAlgoSHA256 + " " + hex.EncodeToString(h.Sum(nil)), nil
+	default:
+		return "", fmt.Errorf("unsupported checksum algo %q", algo)
+	}
+}
+
 const (
-	tusVersion        = "1.0.0"
-	patchContentType  = "application/offset+octet-stream"
-	headerTusResume   = "Tus-Resumable"
-	headerUploadOff   = "Upload-Offset"
-	headerUploadLen   = "Upload-Length"
-	headerUploadMeta  = "Upload-Metadata"
-	headerIdemKey     = "Idempotency-Key"
-	headerLocation    = "Location"
-	headerAuth        = "Authorization"
-	headerContentType = "Content-Type"
+	tusVersion         = "1.0.0"
+	patchContentType   = "application/offset+octet-stream"
+	headerTusResume    = "Tus-Resumable"
+	headerUploadOff    = "Upload-Offset"
+	headerUploadLen    = "Upload-Length"
+	headerUploadMeta   = "Upload-Metadata"
+	headerIdemKey      = "Idempotency-Key"
+	headerLocation     = "Location"
+	headerAuth         = "Authorization"
+	headerContentType  = "Content-Type"
+	headerUploadCksum  = "Upload-Checksum"
+	checksumAlgoCRC32C = "crc32c"
+	checksumAlgoSHA256 = "sha256"
+	checksumAlgoNone   = "none"
 )
 
 // Client is a stateful uploader bound to a single peer URL + token. Reuse
@@ -58,6 +87,10 @@ type UploadOptions struct {
 	ChunkSize      int64
 	IdempotencyKey string // optional
 	Progress       *Progress
+	// Checksum names the per-chunk hash algorithm to send in
+	// Upload-Checksum. Supported values: "crc32c" (default), "sha256",
+	// or "" / "none" to disable. CLI maps `--no-checksum` to "none".
+	Checksum string
 }
 
 // UploadResult summarizes a successful upload.
@@ -94,6 +127,21 @@ func (c *Client) Upload(ctx context.Context, filePath string, opts UploadOptions
 	}
 	if opts.ChunkSize < 1 || opts.ChunkSize > MaxChunkSizeBytes {
 		return nil, fmt.Errorf("chunk size out of range: %d (max %d)", opts.ChunkSize, MaxChunkSizeBytes)
+	}
+
+	// Resolve the per-chunk checksum algorithm. Default = crc32c. Empty
+	// (zero value) keeps the historic behavior - which we treat as "use the
+	// default" since clients written before this knob existed won't know
+	// to set it. CLI users who actively want to disable checksums pass
+	// "none".
+	algo := opts.Checksum
+	if algo == "" {
+		algo = checksumAlgoCRC32C
+	}
+	switch algo {
+	case checksumAlgoCRC32C, checksumAlgoSHA256, checksumAlgoNone:
+	default:
+		return nil, fmt.Errorf("unsupported checksum algo %q (want crc32c|sha256|none)", algo)
 	}
 
 	chunker, err := NewChunker(filePath, opts.ChunkSize)
@@ -139,7 +187,7 @@ func (c *Client) Upload(ctx context.Context, filePath string, opts UploadOptions
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if err := c.patchOne(ctx, uploadURL, chunker, opts.Progress); err != nil {
+		if err := c.patchOne(ctx, uploadURL, chunker, opts.Progress, algo); err != nil {
 			return nil, err
 		}
 	}
@@ -227,7 +275,10 @@ func (c *Client) createUpload(ctx context.Context, namespace string, size int64,
 // patchOne sends a single PATCH. Handles 409 (HEAD + resume), 5xx (retry with
 // HEAD reseed each attempt), and 4xx-not-409 (permanent error). On full
 // success, advances the chunker and the progress reporter.
-func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, prog *Progress) error {
+//
+// algo selects the per-chunk hash sent in Upload-Checksum: "crc32c",
+// "sha256", or "none" to disable.
+func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, prog *Progress, algo string) error {
 	bo := c.NewBackoff()
 
 	// We capture the chunk metadata once per outer call. Each attempt
@@ -254,7 +305,26 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 			return backoff.Permanent(rerr)
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPatch, uploadURL, bodyR)
+		// To compute Upload-Checksum we need the digest BEFORE we send
+		// the body, so read the chunk into a buffer and hash it.
+		// chunkLen is bounded by the configured chunk size (default
+		// 4 MiB, max 64 MiB), so this is bounded memory.
+		var reqBody io.Reader = bodyR
+		var cksumHeaderVal string
+		if algo != checksumAlgoNone {
+			buf := make([]byte, chunkLen)
+			if _, rerr := io.ReadFull(bodyR, buf); rerr != nil {
+				return backoff.Permanent(fmt.Errorf("read chunk: %w", rerr))
+			}
+			cv, cerr := computeChunkChecksum(algo, buf)
+			if cerr != nil {
+				return backoff.Permanent(cerr)
+			}
+			cksumHeaderVal = cv
+			reqBody = bytes.NewReader(buf)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPatch, uploadURL, reqBody)
 		if err != nil {
 			return backoff.Permanent(err)
 		}
@@ -262,6 +332,9 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 		req.Header.Set(headerAuth, "Bearer "+c.Token)
 		req.Header.Set(headerContentType, patchContentType)
 		req.Header.Set(headerUploadOff, strconv.FormatInt(startOffset, 10))
+		if cksumHeaderVal != "" {
+			req.Header.Set(headerUploadCksum, cksumHeaderVal)
+		}
 		req.ContentLength = chunkLen
 
 		resp, err := c.HTTP.Do(req)

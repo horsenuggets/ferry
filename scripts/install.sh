@@ -177,6 +177,7 @@ if [[ ! -f /etc/ferry/config.json ]]; then
   "tokens_path": "/etc/ferry/tokens.json",
   "completed_retention_seconds": 86400,
   "incomplete_retention_seconds": 604800,
+  "gc_interval_seconds": 3600,
   "max_patch_bytes": 67108864,
   "disk_safety_margin_bytes": 1073741824
 }

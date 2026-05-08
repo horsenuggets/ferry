@@ -46,22 +46,35 @@ func New(cfg *Config, version string, logger *slog.Logger) (*Server, error) {
 }
 
 // Run starts the HTTP server and blocks until ctx is canceled, then drains
-// in-flight requests up to 10s before returning.
-//
-// TODO(phase 4): GC sweeper for completed/incomplete uploads beyond their
-// retention windows. Stubbed here so the lifecycle is in place.
+// in-flight requests up to 10s before returning. A GC sweeper runs in a
+// background goroutine, sharing the locker with the request handler so
+// uploads can never be reaped mid-PATCH.
 func (s *Server) Run(ctx context.Context, version string) error {
+	locker := NewLocker()
+	completedTTL := time.Duration(s.cfg.CompletedRetentionSeconds) * time.Second
+	incompleteTTL := time.Duration(s.cfg.IncompleteRetentionSeconds) * time.Second
+
 	h := NewHandler(HandlerConfig{
 		Store:         s.store,
 		Auth:          s.auth,
-		Locker:        NewLocker(),
+		Locker:        locker,
 		MaxPatchBytes: s.cfg.MaxPatchBytes,
 		SafetyMargin:  s.cfg.DiskSafetyMarginBytes,
-		CompletedTTL:  time.Duration(s.cfg.CompletedRetentionSeconds) * time.Second,
-		IncompleteTTL: time.Duration(s.cfg.IncompleteRetentionSeconds) * time.Second,
+		CompletedTTL:  completedTTL,
+		IncompleteTTL: incompleteTTL,
 		Version:       version,
 		Logger:        s.logger,
 	})
+
+	gc := NewGC(GCConfig{
+		Store:         s.store,
+		Locker:        locker,
+		Interval:      time.Duration(s.cfg.GCIntervalSeconds) * time.Second,
+		CompletedTTL:  completedTTL,
+		IncompleteTTL: incompleteTTL,
+		Logger:        s.logger,
+	})
+	go gc.Run(ctx)
 	listener, err := net.Listen("tcp", s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.cfg.ListenAddr, err)

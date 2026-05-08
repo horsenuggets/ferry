@@ -23,7 +23,18 @@ var (
 	ErrUnauthorized        = errors.New("unauthorized")
 	ErrForbidden           = errors.New("forbidden")
 	ErrInternal            = errors.New("internal error")
+	// ErrChecksumMismatch is returned when the body of a PATCH didn't hash to
+	// the value declared in Upload-Checksum. Maps to HTTP 460 per the tus
+	// checksum extension - non-standard, but spec-mandated for tus checksum.
+	ErrChecksumMismatch = errors.New("checksum mismatch")
+	// ErrUnsupportedChecksumAlgo is returned when Upload-Checksum names an
+	// algorithm ferry doesn't support (it accepts crc32c and sha256). 400.
+	ErrUnsupportedChecksumAlgo = errors.New("unsupported checksum algorithm")
 )
+
+// statusChecksumMismatch is the tus checksum-extension status code. Not in
+// http.StatusXxx because it's non-standard.
+const statusChecksumMismatch = 460
 
 // statusFor maps a protocol error to an HTTP status code.
 func statusFor(err error) int {
@@ -48,6 +59,10 @@ func statusFor(err error) int {
 		return http.StatusUnauthorized // 401
 	case errors.Is(err, ErrForbidden):
 		return http.StatusForbidden // 403
+	case errors.Is(err, ErrChecksumMismatch):
+		return statusChecksumMismatch // 460
+	case errors.Is(err, ErrUnsupportedChecksumAlgo):
+		return http.StatusBadRequest // 400
 	default:
 		return http.StatusInternalServerError // 500
 	}
