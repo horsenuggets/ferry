@@ -18,3 +18,11 @@ if ! command -v golangci-lint >/dev/null 2>&1; then
   exit 1
 fi
 golangci-lint run
+
+# Shell linting: check our bash scripts with shellcheck if available. CI runs
+# shellcheck unconditionally; locally it's best-effort.
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck scripts/install.sh scripts/uninstall.sh tests/scripts/install_test.sh
+else
+  echo "shellcheck not found on PATH; skipping shell-script lint"
+fi

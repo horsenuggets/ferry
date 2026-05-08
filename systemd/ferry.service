@@ -1,0 +1,32 @@
+[Unit]
+Description=ferry - fault-tolerant chunked file uploader
+Documentation=https://github.com/horsenuggets/ferry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ferry
+Group=ferry
+ExecStart=@@FERRY_BIN@@ listen --config /etc/ferry/config.json
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65535
+
+# Sandboxing: read /etc/ferry, write /var/lib/ferry + /var/log/ferry only.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ferry /var/log/ferry
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

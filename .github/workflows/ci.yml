@@ -19,8 +19,12 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
             | sh -s -- -b "$(go env GOPATH)/bin" v1.62.2
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: lint
         run: ./scripts/lint.sh
+      - name: install/uninstall script smoke
+        run: bash tests/scripts/install_test.sh
 
   test:
     runs-on: ubuntu-latest
