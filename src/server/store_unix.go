@@ -4,6 +4,7 @@ package server
 
 import (
 	"fmt"
+	"math"
 
 	"golang.org/x/sys/unix"
 )
@@ -14,12 +15,12 @@ func availableBytes(root string) (int64, error) {
 	if err := unix.Statfs(root, &fs); err != nil {
 		return 0, fmt.Errorf("statfs: %w", err)
 	}
-	// Bavail/Bsize are unsigned. Cap the product at maxInt64 to avoid an
-	// uint64 -> int64 overflow on absurdly-large filesystems (gosec G115).
-	const maxInt64 = int64(^uint64(0) >> 1)
-	avail := uint64(fs.Bavail) * uint64(fs.Bsize)
-	if avail > uint64(maxInt64) {
-		return maxInt64, nil
+	// Bavail/Bsize are unsigned on Linux and signed on Darwin/BSD. Coerce
+	// each to uint64 first, then cap the product at math.MaxInt64 before
+	// the final int64 conversion to dodge overflow.
+	avail := uint64(fs.Bavail) * uint64(fs.Bsize) //nolint:gosec // bounded below
+	if avail > math.MaxInt64 {
+		return math.MaxInt64, nil
 	}
-	return int64(avail), nil
+	return int64(avail), nil //nolint:gosec // bounded above by MaxInt64 check
 }
