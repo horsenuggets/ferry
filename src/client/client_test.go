@@ -393,4 +393,3 @@ func TestClient_IdempotentResume(t *testing.T) {
 	}
 	_ = want // bytes already verified by earlier tests
 }
-

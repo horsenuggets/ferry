@@ -70,6 +70,15 @@ func IsRetryable(err error) bool {
 		if netErr.Timeout() {
 			return true
 		}
+		// net.Error.Temporary() is deprecated but still set by some
+		// transports for transient failures (notably DNS truncation,
+		// listener-backlog drops). Honor it when present so the
+		// docstring's "timeouts or temporary" promise actually holds.
+		//nolint:staticcheck // intentional use of deprecated Temporary()
+		type temporary interface{ Temporary() bool }
+		if t, ok := any(netErr).(temporary); ok && t.Temporary() {
+			return true
+		}
 	}
 
 	var sysErr syscall.Errno

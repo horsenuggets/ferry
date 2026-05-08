@@ -274,6 +274,12 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 			if err := c.refreshChunker(ctx, uploadURL, ch, &startOffset, &chunkLen); err != nil {
 				return err // already classified
 			}
+			// Sync the progress reporter to whatever the server actually
+			// has now, so the bar reflects bytes the server kept from a
+			// partial PATCH and doesn't permanently under-report.
+			if prog != nil {
+				prog.SetBytes(startOffset)
+			}
 			return err
 		}
 		defer resp.Body.Close()
@@ -315,6 +321,11 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 			if remaining < chunkLen {
 				chunkLen = remaining
 			}
+			// Sync the progress reporter to the server's truth so a
+			// retried 409 doesn't leave the bar lagging or jumping.
+			if prog != nil {
+				prog.SetBytes(off)
+			}
 			if chunkLen == 0 {
 				// Server already has everything; sync chunker and we're done with this chunk.
 				if err := ch.SeekTo(off); err != nil {
@@ -328,11 +339,18 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 			// Treat as retryable so the backoff machinery re-invokes us.
 			return fmt.Errorf("offset conflict (now %d), resuming", off)
 		case retry:
-			// 5xx / 408 / 429: refresh offset and retry.
+			// 5xx / 408 / 425 / 429: refresh offset and retry. Don't
+			// wrap as *PermanentError: callers use errors.As to spot
+			// terminal failures, and a transient server error must not
+			// be reported with permanent semantics until backoff has
+			// actually given up.
 			if err := c.refreshChunker(ctx, uploadURL, ch, &startOffset, &chunkLen); err != nil {
 				return err
 			}
-			return &PermanentError{Status: resp.StatusCode, Body: string(body)} // wrapped retryable below
+			if prog != nil {
+				prog.SetBytes(startOffset)
+			}
+			return fmt.Errorf("server returned %d %s: %s", resp.StatusCode, http.StatusText(resp.StatusCode), string(body))
 		default:
 			// 4xx-other (including 401, 403, 400, 413, 415): permanent.
 			return backoff.Permanent(&PermanentError{
@@ -485,8 +503,11 @@ func classifyResponse(status int, body string) (string, int, error) {
 	if status == http.StatusConflict {
 		return "", status, errors.New("offset conflict (use HEAD to recover)")
 	}
-	if status >= 500 || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests {
-		// Retryable.
+	// Mirror ClassifyStatus' retryable set so POST/HEAD share the policy
+	// applied to PATCH: 5xx, 408 Request Timeout, 425 Too Early, 429 Too
+	// Many Requests.
+	if status >= 500 || status == http.StatusRequestTimeout ||
+		status == http.StatusTooEarly || status == http.StatusTooManyRequests {
 		return "", status, fmt.Errorf("server returned %d: %s", status, body)
 	}
 	return "", status, &PermanentError{Status: status, Body: body}
