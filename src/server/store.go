@@ -29,17 +29,17 @@ import (
 // ConcatConsumedAt is set on a partial after a final has stitched it, so the
 // GC sweeper can reap consumed partials after a short retention window.
 type Info struct {
-	ID                string            `json:"id"`
-	Namespace         string            `json:"namespace"`
-	Size              int64             `json:"size"`
-	Metadata          map[string]string `json:"metadata,omitempty"`
-	CreatedAt         time.Time         `json:"created_at"`
-	ExpiresAt         time.Time         `json:"expires_at"`
-	CompletedAt       *time.Time        `json:"completed_at"`
-	IdempotencyKey    string            `json:"idempotency_key,omitempty"`
-	Concat            string            `json:"concat,omitempty"`
-	ConcatSourceIDs   []string          `json:"concat_source_ids,omitempty"`
-	ConcatConsumedAt  *time.Time        `json:"concat_consumed_at,omitempty"`
+	ID               string            `json:"id"`
+	Namespace        string            `json:"namespace"`
+	Size             int64             `json:"size"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
+	ExpiresAt        time.Time         `json:"expires_at"`
+	CompletedAt      *time.Time        `json:"completed_at"`
+	IdempotencyKey   string            `json:"idempotency_key,omitempty"`
+	Concat           string            `json:"concat,omitempty"`
+	ConcatSourceIDs  []string          `json:"concat_source_ids,omitempty"`
+	ConcatConsumedAt *time.Time        `json:"concat_consumed_at,omitempty"`
 }
 
 // Store wraps the on-disk filesystem layout for ferry uploads.

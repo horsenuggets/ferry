@@ -364,10 +364,10 @@ func TestJoinPartialURLs(t *testing.T) {
 // TestPathOnly handles common URL shapes for Upload-Concat sources.
 func TestPathOnly(t *testing.T) {
 	cases := map[string]string{
-		"/v1/uploads/a/b":              "/v1/uploads/a/b",
-		"http://h/v1/uploads/a/b":      "/v1/uploads/a/b",
+		"/v1/uploads/a/b":               "/v1/uploads/a/b",
+		"http://h/v1/uploads/a/b":       "/v1/uploads/a/b",
 		"https://h:1234/v1/uploads/a/b": "/v1/uploads/a/b",
-		"http://h":                     "",
+		"http://h":                      "",
 	}
 	for in, want := range cases {
 		if got := pathOnly(in); got != want {
@@ -512,4 +512,3 @@ func TestProgressAggregates(t *testing.T) {
 		t.Errorf("Size = %d, want %d", res.Size, fileSize)
 	}
 }
-

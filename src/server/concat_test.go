@@ -55,10 +55,10 @@ func (r *testRig) uploadPartial(t *testing.T, namespace string, body []byte) str
 
 func TestParseUploadConcat(t *testing.T) {
 	cases := []struct {
-		in     string
-		want   string // Kind
-		nSrcs  int
-		fail   bool
+		in    string
+		want  string // Kind
+		nSrcs int
+		fail  bool
 	}{
 		{"", "", 0, false},
 		{"partial", "partial", 0, false},
