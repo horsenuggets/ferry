@@ -19,7 +19,7 @@ can skip the dead ends.
 
 In all command snippets below, substitute:
 
-- `<ssh-host>` - your SSH alias for the Windows host (e.g. `msi`).
+- `<ssh-host>` - your SSH alias for the Windows host (e.g. `<windows-host>`).
 - `<TOKEN>` - the bearer token printed during step 5.
 - `<UPLOAD_ID>` - the upload id printed by `ferry upload` on completion.
 
@@ -164,7 +164,7 @@ WSL2 mirrors localhost by default - port 7421 inside FerryTest is also reachable
 on `127.0.0.1:7421` of the Windows host. So a single SSH `-L` is enough:
 
 ```sh
-ssh -N -L 17421:127.0.0.1:7421 msi &
+ssh -N -L 17421:127.0.0.1:7421 <windows-host> &
 TUNNEL_PID=$!
 sleep 3
 curl -sS http://127.0.0.1:17421/health   # {"ok":true,"version":"0.0.1"}
