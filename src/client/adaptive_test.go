@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -195,19 +196,8 @@ func TestPatchOne_ResponseHeaderTimeoutErrorMessage(t *testing.T) {
 	}
 }
 
-// readAll is a tiny helper to read+discard a body without pulling io into
-// every test. Returns total bytes consumed.
-func readAll(r interface{ Read(p []byte) (int, error) }) (int64, error) {
-	var total int64
-	buf := make([]byte, 4096)
-	for {
-		n, err := r.Read(buf)
-		total += int64(n)
-		if err != nil {
-			if err.Error() == "EOF" {
-				return total, nil
-			}
-			return total, err
-		}
-	}
+// readAll reads r to completion and returns the byte count. Wraps io.Copy
+// so EOF detection is robust to wrapped errors.
+func readAll(r io.Reader) (int64, error) {
+	return io.Copy(io.Discard, r)
 }

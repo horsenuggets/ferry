@@ -318,7 +318,6 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 		// On the first attempt this is a no-op. On a retry, we HEAD first
 		// to learn the actual server offset (which may differ from
 		// startOffset if a prior attempt absorbed some bytes).
-		attemptStart := time.Now()
 		bodyR, rerr := ch.ReaderAt(startOffset, chunkLen)
 		if rerr != nil {
 			return backoff.Permanent(rerr)
@@ -359,17 +358,24 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 		}
 		req.ContentLength = chunkLen
 
+		// Measure throughput from just before HTTP.Do (so the wall time
+		// reflects request body upload + response header wait, NOT the
+		// preceding disk read or checksum compute).
+		attemptStart := time.Now()
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
 			// Surface a more actionable error when the server failed to
-			// start sending response headers within ResponseHeaderTimeout.
-			// On slow / saturated uplinks the user's best lever is a
-			// smaller --chunk-size; mention it explicitly.
+			// start sending response headers within the configured
+			// transport timeout. On slow / saturated uplinks the user's
+			// best lever is a smaller --chunk-size; mention it
+			// explicitly. The timeout duration is read from the live
+			// transport so the message reflects what was actually used,
+			// not just the package-level default.
 			if isResponseHeaderTimeout(err) {
 				err = fmt.Errorf(
 					"timed out waiting %s for response headers after sending %d bytes; "+
 						"consider --chunk-size <smaller> or check upstream bandwidth: %w",
-					ResponseHeaderTimeout, chunkLen, err,
+					responseHeaderTimeoutOf(c.HTTP), chunkLen, err,
 				)
 			}
 			if !IsRetryable(err) {

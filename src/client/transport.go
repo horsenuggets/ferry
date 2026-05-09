@@ -6,6 +6,25 @@ import (
 	"time"
 )
 
+// responseHeaderTimeoutOf returns the live ResponseHeaderTimeout setting on
+// the client's transport, or ResponseHeaderTimeout (the package default) if
+// the transport isn't an *http.Transport or has no timeout set. Used by
+// error messages so they reflect what was actually configured rather than
+// the package default — tests and callers can override the timeout.
+func responseHeaderTimeoutOf(c *http.Client) time.Duration {
+	if c == nil {
+		return ResponseHeaderTimeout
+	}
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok || tr == nil {
+		return ResponseHeaderTimeout
+	}
+	if tr.ResponseHeaderTimeout > 0 {
+		return tr.ResponseHeaderTimeout
+	}
+	return ResponseHeaderTimeout
+}
+
 // ResponseHeaderTimeout is the maximum time the client waits for the server
 // to start sending response headers after the PATCH body has been fully
 // written. Exposed as a package-level constant so error messages and tests

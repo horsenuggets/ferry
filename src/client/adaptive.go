@@ -115,4 +115,3 @@ func isResponseHeaderTimeout(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "timeout awaiting response headers")
 }
-
