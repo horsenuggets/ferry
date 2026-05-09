@@ -162,9 +162,17 @@ type slab struct {
 	length int64
 }
 
+// minSlabBytes is the smallest slab we'll create. Below this, splitting
+// just multiplies round trips with no parallelism win. A 64 KiB floor
+// matches typical TCP socket buffers and keeps tiny files (under a few
+// hundred KiB) on a single slab even with --parallel 16.
+const minSlabBytes int64 = 64 * 1024
+
 // splitSlabs divides total bytes into n contiguous, non-overlapping slabs.
 // The last slab may be smaller. Empty file produces a single 0-length slab
 // so callers can still drive a single create+final round trip uniformly.
+// For small files (total / n < minSlabBytes) we collapse to fewer slabs to
+// avoid wasting round trips on near-trivial transfers.
 func splitSlabs(total int64, n int) []slab {
 	if n < 1 {
 		n = 1
@@ -172,10 +180,9 @@ func splitSlabs(total int64, n int) []slab {
 	if total <= 0 {
 		return []slab{{0, 0}}
 	}
-	// If n exceeds total bytes, downshift so we don't make zero-length
-	// trailing slabs (which the server accepts but waste round trips).
-	if int64(n) > total {
-		n = int(total)
+	// Downshift n so each slab has at least minSlabBytes (last may be less).
+	for n > 1 && total/int64(n) < minSlabBytes {
+		n--
 	}
 	base := total / int64(n)
 	rem := total % int64(n)
@@ -384,7 +391,14 @@ func (c *Client) patchSlabChunk(ctx context.Context, f *os.File, slabStart int64
 		var reqBody io.Reader = sect
 		var cksumHeaderVal string
 		if algo != checksumAlgoNone {
-			buf := make([]byte, chunkLen)
+			// chunkLen is int64 but make takes int. Bound by
+			// MaxChunkSizeBytes (64 MiB) at the call site, so this
+			// fits in int even on 32-bit platforms - but assert
+			// explicitly to keep the conversion local and auditable.
+			if chunkLen < 0 || chunkLen > MaxChunkSizeBytes {
+				return backoff.Permanent(fmt.Errorf("chunkLen %d out of range", chunkLen))
+			}
+			buf := make([]byte, int(chunkLen))
 			if _, rerr := io.ReadFull(sect, buf); rerr != nil {
 				return backoff.Permanent(fmt.Errorf("read chunk: %w", rerr))
 			}

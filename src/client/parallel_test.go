@@ -138,6 +138,7 @@ func noopBackoff() backoff.BackOff {
 }
 
 func TestSplitSlabs(t *testing.T) {
+	const big = int64(minSlabBytes) // 64 KiB
 	cases := []struct {
 		total int64
 		n     int
@@ -145,9 +146,13 @@ func TestSplitSlabs(t *testing.T) {
 	}{
 		{0, 4, []slab{{0, 0}}},
 		{10, 1, []slab{{0, 10}}},
-		{10, 2, []slab{{0, 5}, {5, 5}}},
-		{10, 3, []slab{{0, 4}, {4, 3}, {7, 3}}},
-		{2, 4, []slab{{0, 1}, {1, 1}}}, // n > total downshifts
+		// Small files collapse to a single slab to avoid wasted round
+		// trips: 10 bytes / 4 workers = 2 bytes per slab, far below
+		// minSlabBytes, so we downshift all the way to n=1.
+		{10, 4, []slab{{0, 10}}},
+		// Once each slab clears the minSlabBytes floor, we honor n.
+		{4 * big, 4, []slab{{0, big}, {big, big}, {2 * big, big}, {3 * big, big}}},
+		{4*big + 3, 4, []slab{{0, big + 1}, {big + 1, big + 1}, {2*big + 2, big + 1}, {3*big + 3, big}}},
 	}
 	for _, tc := range cases {
 		got := splitSlabs(tc.total, tc.n)

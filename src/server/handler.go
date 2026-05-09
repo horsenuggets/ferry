@@ -199,10 +199,23 @@ func (h *Handler) postUpload(w http.ResponseWriter, r *http.Request, namespace s
 // order, atomic-renames into place, writes the final's sidecar, and stamps
 // the partials as consumed so the GC sweeper can reap them later.
 func (h *Handler) postFinal(w http.ResponseWriter, r *http.Request, namespace string, concat ParsedConcat) {
+	// Per tus, the final POST has no body. Reject any client that ships
+	// one - including chunked-transfer requests where ContentLength==-1.
+	// We attempt a 1-byte read to discriminate "empty stream" from
+	// "stream with content". Always close the body so connection reuse
+	// stays sane regardless of which branch we take.
+	defer func() { _, _ = io.Copy(io.Discard, r.Body); _ = r.Body.Close() }()
 	if r.ContentLength > 0 {
-		// Per tus, the final POST has no body.
 		http.Error(w, "Upload-Concat: final must have empty body", http.StatusBadRequest)
 		return
+	}
+	if r.ContentLength < 0 { // chunked
+		var probe [1]byte
+		n, _ := io.ReadFull(r.Body, probe[:])
+		if n > 0 {
+			http.Error(w, "Upload-Concat: final must have empty body", http.StatusBadRequest)
+			return
+		}
 	}
 
 	sources, total, err := resolveConcatSources(h.store, namespace, concat.Sources)

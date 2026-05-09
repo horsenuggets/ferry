@@ -267,6 +267,30 @@ func TestConcatFinalRejectsBody(t *testing.T) {
 	}
 }
 
+// TestConcatFinalRejectsChunkedBody covers the chunked-transfer branch
+// where ContentLength is -1 but the client still ships bytes. The handler
+// must read enough to detect the body and reject.
+func TestConcatFinalRejectsChunkedBody(t *testing.T) {
+	r := newRig(t)
+	la := r.uploadPartial(t, "alpha", []byte("data"))
+	hdr := "final;" + pathOf(la)
+	// Build a request whose body has no ContentLength set: setting Body
+	// to a Reader that net/http can't size produces chunked encoding.
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = pw.Write([]byte("chunked-payload-not-allowed"))
+		_ = pw.Close()
+	}()
+	req := r.newReq(t, "POST", "/v1/uploads/alpha", pr)
+	req.Header.Set("Upload-Concat", hdr)
+	req.ContentLength = -1 // chunked
+	resp := r.do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
 // TestConcatStitchSurvivesDuplicateMark exercises markConcatConsumed when
 // some sources are already stamped (e.g. a duplicate concurrent final).
 func TestConcatStitchSurvivesDuplicateMark(t *testing.T) {
