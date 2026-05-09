@@ -148,7 +148,7 @@ func TestPatchOne_ResponseHeaderTimeoutErrorMessage(t *testing.T) {
 	hang := make(chan struct{})
 	defer close(hang)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/uploads/alpha", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/uploads/alpha", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Tus-Resumable", "1.0.0")
 		w.Header().Set("Location", "/v1/uploads/alpha/test-id")
 		w.WriteHeader(http.StatusCreated)
