@@ -50,6 +50,7 @@ Flags:
   --json                 Emit JSON progress + completion to stdout
   --idempotency-key <k>  Optional Idempotency-Key for the create POST
   --chunk-size <bytes>   PATCH body size (default 4194304, max 67108864)
+  --no-adaptive-chunks   Disable adaptive chunk-size shrinking on slow links
   --checksum <algo>      Per-chunk Upload-Checksum: crc32c (default), sha256, or none
   --no-checksum          Shortcut for --checksum=none
   --help                 Show this help
@@ -198,6 +199,7 @@ func runUpload(args []string, stdout, stderr io.Writer) int {
 	jsonOut := fs.Bool("json", false, "emit JSON output")
 	idem := fs.String("idempotency-key", "", "idempotency key")
 	chunk := fs.Int64("chunk-size", 0, "PATCH body size in bytes")
+	noAdaptive := fs.Bool("no-adaptive-chunks", false, "disable adaptive chunk sizing on slow links")
 	checksum := fs.String("checksum", "crc32c", "per-chunk Upload-Checksum algo")
 	noChecksum := fs.Bool("no-checksum", false, "disable per-chunk Upload-Checksum")
 	help := fs.Bool("help", false, "show help")
@@ -254,12 +256,13 @@ func runUpload(args []string, stdout, stderr io.Writer) int {
 		cksumAlgo = "none"
 	}
 	res, err := c.Upload(ctx, filePath, client.UploadOptions{
-		Namespace:      resolved.Namespace,
-		RemoteName:     *as,
-		ChunkSize:      resolved.ChunkSize,
-		IdempotencyKey: *idem,
-		Progress:       prog,
-		Checksum:       cksumAlgo,
+		Namespace:        resolved.Namespace,
+		RemoteName:       *as,
+		ChunkSize:        resolved.ChunkSize,
+		IdempotencyKey:   *idem,
+		Progress:         prog,
+		Checksum:         cksumAlgo,
+		NoAdaptiveChunks: *noAdaptive,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "ferry upload: %v\n", err)
