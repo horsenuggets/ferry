@@ -16,15 +16,30 @@ import (
 // Info is the persisted sidecar metadata for an upload (.info file). The
 // canonical offset on resume comes from os.Stat of the .partial file; we do
 // NOT trust an "offset" field in the sidecar (mirroring tusd's behavior).
+//
+// Concat fields support the tus concatenation extension. Backward compatible:
+// .info files written before these fields existed parse with empty values.
+//
+//   - Concat == "partial": this upload is one slab of a future final upload.
+//   - Concat == "final": this upload was created by stitching partials. The
+//     binary at <id> is the concatenation; ConcatSourceIDs lists the partials
+//     consumed in order.
+//   - Concat == "" (default): a regular standalone upload.
+//
+// ConcatConsumedAt is set on a partial after a final has stitched it, so the
+// GC sweeper can reap consumed partials after a short retention window.
 type Info struct {
-	ID             string            `json:"id"`
-	Namespace      string            `json:"namespace"`
-	Size           int64             `json:"size"`
-	Metadata       map[string]string `json:"metadata,omitempty"`
-	CreatedAt      time.Time         `json:"created_at"`
-	ExpiresAt      time.Time         `json:"expires_at"`
-	CompletedAt    *time.Time        `json:"completed_at"`
-	IdempotencyKey string            `json:"idempotency_key,omitempty"`
+	ID                string            `json:"id"`
+	Namespace         string            `json:"namespace"`
+	Size              int64             `json:"size"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
+	CreatedAt         time.Time         `json:"created_at"`
+	ExpiresAt         time.Time         `json:"expires_at"`
+	CompletedAt       *time.Time        `json:"completed_at"`
+	IdempotencyKey    string            `json:"idempotency_key,omitempty"`
+	Concat            string            `json:"concat,omitempty"`
+	ConcatSourceIDs   []string          `json:"concat_source_ids,omitempty"`
+	ConcatConsumedAt  *time.Time        `json:"concat_consumed_at,omitempty"`
 }
 
 // Store wraps the on-disk filesystem layout for ferry uploads.
@@ -100,6 +115,29 @@ func (s *Store) nsDir(namespace string) string {
 	return filepath.Join(s.root, namespace)
 }
 
+// NamespaceDir is the exported accessor for the namespace directory. Used by
+// the concatenation handler when it needs to fsync the parent directory after
+// stitching partials into a final.
+func (s *Store) NamespaceDir(namespace string) string { return s.nsDir(namespace) }
+
+// CompletedPath returns the absolute path of the completed binary for an
+// upload. Exported for the concatenation handler so it can read partial
+// bodies and write the stitched final.
+func (s *Store) CompletedPath(namespace, id string) string {
+	return s.completedPath(namespace, id)
+}
+
+// PartialPath returns the absolute path of the in-progress binary for an
+// upload. Exported for the concatenation handler so it can write the final's
+// .partial before atomic-renaming it on success.
+func (s *Store) PartialPath(namespace, id string) string {
+	return s.partialPath(namespace, id)
+}
+
+// FsyncDir is the exported wrapper around the package-private fsyncDir.
+// Used by the concatenation handler.
+func (s *Store) FsyncDir(dir string) error { return fsyncDir(dir) }
+
 func (s *Store) partialPath(namespace, id string) string {
 	return filepath.Join(s.nsDir(namespace), id+".partial")
 }
@@ -149,6 +187,11 @@ func (s *Store) Create(info Info) error {
 	}
 	return nil
 }
+
+// WriteInfo is the exported variant of writeInfo, used by the concatenation
+// handler to update sidecars in-place (e.g. stamp ConcatConsumedAt on a
+// partial that's been absorbed into a final).
+func (s *Store) WriteInfo(info Info) error { return s.writeInfo(info) }
 
 // writeInfo writes the sidecar atomically: write tmp, fsync, rename, fsync
 // parent dir.
