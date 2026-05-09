@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // Server is a thin lifecycle wrapper around an http.Server with a Handler.
@@ -92,8 +95,26 @@ func (s *Server) Run(ctx context.Context, version string) error {
 	defer cancelGC()
 	go gc.Run(gcCtx)
 
+	// Wrap the routes in h2c so plain-HTTP clients can speak HTTP/2 over
+	// cleartext. ferry runs over private links (WireGuard / loopback /
+	// LAN) so TLS would be wasted overhead; HTTP/2's connection-level
+	// flow control + single-slow-start dwarf any framing overhead and
+	// matter most on high-RTT paths. HTTP/1.1 clients still work because
+	// h2c.NewHandler intercepts only h2c-prefixed traffic and forwards
+	// everything else to the inner handler unchanged.
+	//
+	// MaxUploadBuffer{PerStream,PerConnection} advertise the initial
+	// flow-control window to the client. Default is 1 MiB / 1 MiB which
+	// throttles uploads on high-BDP links: e.g. on a 70ms RTT path a
+	// stream window of 1 MiB caps single-stream throughput at ~14 MiB/s
+	// regardless of bandwidth. 16 MiB matches the largest chunk size
+	// ferry uses today and is well above realistic single-link BDPs.
+	h2s := &http2.Server{
+		MaxUploadBufferPerStream:     16 * 1024 * 1024,
+		MaxUploadBufferPerConnection: 64 * 1024 * 1024,
+	}
 	srv := &http.Server{
-		Handler:           h.Routes(),
+		Handler:           h2c.NewHandler(h.Routes(), h2s),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
