@@ -53,6 +53,7 @@ Flags:
   --no-adaptive-chunks   Disable adaptive chunk-size shrinking on slow links
   --checksum <algo>      Per-chunk Upload-Checksum: crc32c (default), sha256, or none
   --no-checksum          Shortcut for --checksum=none
+  --parallel <N>         Split into N partial uploads stitched server-side (default 1, max 16)
   --help                 Show this help
 `
 
@@ -202,6 +203,7 @@ func runUpload(args []string, stdout, stderr io.Writer) int {
 	noAdaptive := fs.Bool("no-adaptive-chunks", false, "disable adaptive chunk sizing on slow links")
 	checksum := fs.String("checksum", "crc32c", "per-chunk Upload-Checksum algo")
 	noChecksum := fs.Bool("no-checksum", false, "disable per-chunk Upload-Checksum")
+	parallel := fs.Int("parallel", 1, "concurrent partial uploads (1..16)")
 	help := fs.Bool("help", false, "show help")
 
 	if err := fs.Parse(args); err != nil {
@@ -255,6 +257,10 @@ func runUpload(args []string, stdout, stderr io.Writer) int {
 	if *noChecksum {
 		cksumAlgo = "none"
 	}
+	if *parallel < 1 || *parallel > client.MaxParallelWorkers {
+		fmt.Fprintf(stderr, "ferry upload: --parallel must be between 1 and %d, got %d\n", client.MaxParallelWorkers, *parallel)
+		return 2
+	}
 	res, err := c.Upload(ctx, filePath, client.UploadOptions{
 		Namespace:        resolved.Namespace,
 		RemoteName:       *as,
@@ -263,6 +269,7 @@ func runUpload(args []string, stdout, stderr io.Writer) int {
 		Progress:         prog,
 		Checksum:         cksumAlgo,
 		NoAdaptiveChunks: *noAdaptive,
+		Parallel:         *parallel,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "ferry upload: %v\n", err)

@@ -114,6 +114,21 @@ func (h *Handler) handleUploads(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) postUpload(w http.ResponseWriter, r *http.Request, namespace string) {
+	// Parse Upload-Concat (if any) up front. Three kinds of POST flow:
+	//
+	//   - "" (no header):  regular upload, requires Upload-Length.
+	//   - "partial":       slab of a future final; same shape as regular.
+	//   - "final;<urls>":  stitch existing partials, no Upload-Length.
+	concat, cerr := parseUploadConcat(r.Header.Get("Upload-Concat"))
+	if cerr != nil {
+		http.Error(w, cerr.Error(), http.StatusBadRequest)
+		return
+	}
+	if concat.Kind == concatFinal {
+		h.postFinal(w, r, namespace, concat)
+		return
+	}
+
 	sizeStr := r.Header.Get("Upload-Length")
 	if sizeStr == "" {
 		writeError(w, ErrInvalidUploadLength, "")
@@ -165,6 +180,7 @@ func (h *Handler) postUpload(w http.ResponseWriter, r *http.Request, namespace s
 		CreatedAt:      now,
 		ExpiresAt:      now.Add(h.incompleteTTL),
 		IdempotencyKey: idemKey,
+		Concat:         concat.Kind, // "" or "partial"
 	}
 	if err := h.store.Create(info); err != nil {
 		h.logger.Error("create upload failed", "err", err, "id", info.ID)
@@ -174,6 +190,106 @@ func (h *Handler) postUpload(w http.ResponseWriter, r *http.Request, namespace s
 
 	w.Header().Set("Location", uploadLocation(namespace, info.ID))
 	w.Header().Set("Upload-Expires", info.ExpiresAt.UTC().Format(http.TimeFormat))
+	w.WriteHeader(http.StatusCreated)
+}
+
+// postFinal handles POST /v1/uploads/<ns> with Upload-Concat: final;<urls>.
+// Validates that every referenced source is a completed partial in this
+// namespace, allocates a new ULID for the final, stitches the partials in
+// order, atomic-renames into place, writes the final's sidecar, and stamps
+// the partials as consumed so the GC sweeper can reap them later.
+func (h *Handler) postFinal(w http.ResponseWriter, r *http.Request, namespace string, concat ParsedConcat) {
+	// Per tus, the final POST has no body. Reject any client that ships
+	// one - including chunked-transfer requests where ContentLength==-1.
+	// We attempt a 1-byte read to discriminate "empty stream" from
+	// "stream with content". Always close the body so connection reuse
+	// stays sane regardless of which branch we take.
+	defer func() { _, _ = io.Copy(io.Discard, r.Body); _ = r.Body.Close() }()
+	if r.ContentLength > 0 {
+		http.Error(w, "Upload-Concat: final must have empty body", http.StatusBadRequest)
+		return
+	}
+	if r.ContentLength < 0 { // chunked
+		var probe [1]byte
+		n, _ := io.ReadFull(r.Body, probe[:])
+		if n > 0 {
+			http.Error(w, "Upload-Concat: final must have empty body", http.StatusBadRequest)
+			return
+		}
+	}
+
+	sources, total, err := resolveConcatSources(h.store, namespace, concat.Sources)
+	if err != nil {
+		switch {
+		case errors.Is(err, errInvalidConcatHeader):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.Is(err, errConcatSourceWrongNamespace):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.Is(err, errConcatSourceNotPartial):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.Is(err, errConcatSourceNotCompleted):
+			http.Error(w, "Concat-Source-Not-Completed", http.StatusBadRequest)
+		case errors.Is(err, ErrNotFound):
+			writeError(w, ErrNotFound, "")
+		default:
+			h.logger.Error("resolve concat sources", "err", err)
+			writeError(w, ErrInternal, "")
+		}
+		return
+	}
+
+	// Disk preflight using the stitched total.
+	avail, err := h.store.AvailableBytes()
+	if err != nil {
+		h.logger.Error("statfs failed", "err", err)
+		writeError(w, ErrInternal, "")
+		return
+	}
+	if total > avail-h.safetyMargin {
+		writeError(w, ErrInsufficientStorage, "")
+		return
+	}
+
+	now := time.Now().UTC()
+	completed := now
+	sourceIDs := make([]string, 0, len(sources))
+	for _, s := range sources {
+		sourceIDs = append(sourceIDs, s.ID)
+	}
+	finalInfo := Info{
+		ID:              newID(),
+		Namespace:       namespace,
+		Size:            total,
+		Metadata:        parseMetadata(r.Header.Get("Upload-Metadata")),
+		CreatedAt:       now,
+		ExpiresAt:       now.Add(h.completedTTL),
+		CompletedAt:     &completed,
+		Concat:          concatFinal,
+		ConcatSourceIDs: sourceIDs,
+	}
+
+	if _, err := stitchPartials(r.Context(), h.store, namespace, finalInfo.ID, sources); err != nil {
+		h.logger.Error("stitch partials", "err", err, "id", finalInfo.ID)
+		writeError(w, ErrInternal, "")
+		return
+	}
+	// Sidecar last: the binary is already in place, so a crash here leaves a
+	// completed file with no .info, which the GC sweeper handles as an
+	// orphan.
+	if err := h.store.WriteInfo(finalInfo); err != nil {
+		h.logger.Error("write final info", "err", err, "id", finalInfo.ID)
+		writeError(w, ErrInternal, "")
+		return
+	}
+	if err := markConcatConsumed(h.store, sources, now); err != nil {
+		// Non-fatal: GC will still reap consumed partials when it next sees
+		// the timestamp; we just lost the chance to mark them right now.
+		h.logger.Warn("mark concat consumed", "err", err)
+	}
+
+	w.Header().Set("Location", uploadLocation(namespace, finalInfo.ID))
+	w.Header().Set("Upload-Offset", strconv.FormatInt(total, 10))
+	w.Header().Set("Upload-Length", strconv.FormatInt(total, 10))
 	w.WriteHeader(http.StatusCreated)
 }
 

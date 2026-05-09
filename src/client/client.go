@@ -11,6 +11,7 @@ import (
 	"hash/crc32"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -96,6 +97,12 @@ type UploadOptions struct {
 	// client shrinks the chunk size on slow links and grows it back when
 	// throughput recovers. See adaptive.go.
 	NoAdaptiveChunks bool
+	// Parallel controls the number of concurrent partial uploads stitched
+	// together via the tus concatenation extension. 1 (or 0) keeps the
+	// historic single-stream path; 2..MaxParallelWorkers fans out into N
+	// independent partial uploads, each on its own HTTP connection, then
+	// posts a final concat. See parallel.go.
+	Parallel int
 }
 
 // UploadResult summarizes a successful upload.
@@ -132,6 +139,20 @@ func (c *Client) Upload(ctx context.Context, filePath string, opts UploadOptions
 	}
 	if opts.ChunkSize < 1 || opts.ChunkSize > MaxChunkSizeBytes {
 		return nil, fmt.Errorf("chunk size out of range: %d (max %d)", opts.ChunkSize, MaxChunkSizeBytes)
+	}
+	if opts.Parallel < 0 || opts.Parallel > MaxParallelWorkers {
+		return nil, fmt.Errorf("parallel out of range: %d (max %d)", opts.Parallel, MaxParallelWorkers)
+	}
+	// --parallel >= 2 dispatches to the concatenation-based fan-out path.
+	// --parallel <= 1 keeps the original sequential code path verbatim, so
+	// existing behavior and on-the-wire shape are preserved by default.
+	// 0-byte files take the sequential path regardless: the server
+	// concatenation extension cannot stitch zero-length partials (they
+	// never reach completed state without a PATCH).
+	if opts.Parallel >= 2 {
+		if st, err := os.Stat(filePath); err == nil && st.Size() > 0 {
+			return c.uploadParallel(ctx, filePath, opts, opts.Parallel)
+		}
 	}
 
 	// Resolve the per-chunk checksum algorithm. Default = crc32c. Empty

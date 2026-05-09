@@ -40,6 +40,12 @@ type GC struct {
 // instead of panicking time.NewTicker.
 const minGCInterval = time.Second
 
+// consumedPartialTTL is how long a partial that has been stitched into a
+// final is retained before the GC sweeper reaps it. Short enough that we
+// recover the disk quickly; long enough that a misbehaving client doing a
+// HEAD-after-final has a window to observe the partial still exists.
+const consumedPartialTTL = time.Hour
+
 // NewGC constructs a GC sweeper. Interval is clamped to a minimum so a
 // misconfigured (or zero/negative) gc_interval_seconds doesn't panic the
 // server at runtime.
@@ -159,8 +165,22 @@ func (g *GC) maybeSweepUpload(_ context.Context, ns, id string, now time.Time) b
 	}
 
 	// Decide whether this upload should be reaped.
+	//
+	// Consumed partials get a separate, shorter retention than regular
+	// completed uploads: once a partial is stitched into a final, we keep
+	// it for consumedPartialTTL after ConcatConsumedAt. Importantly, we
+	// also short-circuit the generic CompletedTTL branch for ANY consumed
+	// partial - otherwise a partial completed long ago that's stitched
+	// today would be deleted instantly (CompletedAt is already older
+	// than CompletedTTL), even though the consumed TTL is supposed to
+	// give clients a window to observe it post-stitch.
 	var reason string
 	switch {
+	case info.Concat == concatPartial && info.ConcatConsumedAt != nil:
+		if now.Sub(*info.ConcatConsumedAt) > consumedPartialTTL {
+			reason = "partial consumed by final"
+		}
+		// else: keep, regardless of CompletedAt freshness.
 	case info.CompletedAt != nil:
 		if now.Sub(*info.CompletedAt) > g.cfg.CompletedTTL {
 			reason = "completed retention exceeded"
@@ -194,10 +214,22 @@ func (g *GC) maybeSweepUpload(_ context.Context, ns, id string, now time.Time) b
 		// Already gone, treat as removed.
 		return true
 	}
-	freshCompleted := freshInfo.CompletedAt
-	if freshCompleted != nil && now.Sub(*freshCompleted) <= g.cfg.CompletedTTL {
-		// Completion happened during our sweep; not stale yet.
-		return false
+	// For consumed partials, retention is governed solely by
+	// ConcatConsumedAt + consumedPartialTTL - skip the generic CompletedAt
+	// freshness check entirely. If we still see a consumed partial here,
+	// the first-pass switch above already determined it's past its
+	// consumed TTL; bail early if its ConcatConsumedAt was bumped to
+	// "recent" between the two reads (e.g. another final referenced it).
+	if freshInfo.Concat == concatPartial && freshInfo.ConcatConsumedAt != nil {
+		if now.Sub(*freshInfo.ConcatConsumedAt) <= consumedPartialTTL {
+			return false
+		}
+	} else {
+		freshCompleted := freshInfo.CompletedAt
+		if freshCompleted != nil && now.Sub(*freshCompleted) <= g.cfg.CompletedTTL {
+			// Completion happened during our sweep; not stale yet.
+			return false
+		}
 	}
 
 	if err := g.cfg.Store.Delete(ns, id); err != nil {
