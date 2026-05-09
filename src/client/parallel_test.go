@@ -32,9 +32,9 @@ type flakyProxy struct {
 	patches  atomic.Int32
 }
 
-func newFlakyProxy(t *testing.T, upstream string, every int) *flakyProxy {
+func newFlakyProxy(t *testing.T, upstream string, every int32) *flakyProxy {
 	t.Helper()
-	fp := &flakyProxy{upstream: upstream, every: int32(every)}
+	fp := &flakyProxy{upstream: upstream, every: every}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", fp.handle)
 	fp.Server = httptest.NewServer(mux)
@@ -110,7 +110,9 @@ func makeRandomFile(t *testing.T, n int64) (string, string) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	rng := rand.New(rand.NewSource(int64(n) ^ 0x5eed))
+	// gosec G404: deterministic PRNG is intentional for test fixtures so
+	// failures are reproducible; never used for security.
+	rng := rand.New(rand.NewSource(int64(n) ^ 0x5eed)) // #nosec G404
 	buf := make([]byte, 64*1024)
 	h := sha256.New()
 	var written int64
@@ -304,7 +306,7 @@ func TestUploadParallelEmptyFile(t *testing.T) {
 	defer cleanup()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "empty.bin")
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	c := NewClient(baseURL, token)
@@ -341,7 +343,7 @@ func TestPermanentErrorUnwrap(t *testing.T) {
 
 // TestProgressSetters covers Progress methods that aren't otherwise
 // exercised by the parallel rig.
-func TestProgressSetters(t *testing.T) {
+func TestProgressSetters(_ *testing.T) {
 	p := NewProgress(100, ProgressSilent, nil, nil)
 	p.SetClock(func() time.Time { return time.Unix(0, 0) })
 	p.SetBytes(50)
