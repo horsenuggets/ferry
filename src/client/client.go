@@ -91,6 +91,11 @@ type UploadOptions struct {
 	// Upload-Checksum. Supported values: "crc32c" (default), "sha256",
 	// or "" / "none" to disable. CLI maps `--no-checksum` to "none".
 	Checksum string
+	// NoAdaptiveChunks disables the adaptive chunk-size logic. When true,
+	// every PATCH uses ChunkSize verbatim. When false (default), the
+	// client shrinks the chunk size on slow links and grows it back when
+	// throughput recovers. See adaptive.go.
+	NoAdaptiveChunks bool
 }
 
 // UploadResult summarizes a successful upload.
@@ -183,11 +188,18 @@ func (c *Client) Upload(ctx context.Context, filePath string, opts UploadOptions
 	}
 
 	// Step 2: PATCH chunks until done.
+	//
+	// The adaptive sizer adjusts the per-PATCH chunk size based on
+	// throughput observed on the previous chunk. The first chunk uses the
+	// configured value; subsequent chunks shrink (down to 256 KiB) on
+	// slow links or grow (up to the configured ceiling) when throughput
+	// recovers. See adaptive.go for thresholds and rationale.
+	sizer := newAdaptiveSizer(opts.ChunkSize, !opts.NoAdaptiveChunks)
 	for !chunker.Done() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if err := c.patchOne(ctx, uploadURL, chunker, opts.Progress, algo); err != nil {
+		if err := c.patchOne(ctx, uploadURL, chunker, opts.Progress, algo, sizer); err != nil {
 			return nil, err
 		}
 	}
@@ -278,13 +290,19 @@ func (c *Client) createUpload(ctx context.Context, namespace string, size int64,
 //
 // algo selects the per-chunk hash sent in Upload-Checksum: "crc32c",
 // "sha256", or "none" to disable.
-func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, prog *Progress, algo string) error {
+//
+// sizer supplies the chunk length; if nil, falls back to ch.ChunkSize().
+// Adaptive resizing happens after a successful PATCH via sizer.observe.
+func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, prog *Progress, algo string, sizer *adaptiveSizer) error {
 	bo := c.NewBackoff()
 
 	// We capture the chunk metadata once per outer call. Each attempt
 	// re-seeks (after a HEAD) and re-reads from the file.
 	startOffset := ch.Offset()
-	chunkLen := ch.ChunkSize()
+	chunkLen := sizer.size()
+	if chunkLen <= 0 {
+		chunkLen = ch.ChunkSize()
+	}
 	if remaining := ch.Size() - startOffset; remaining < chunkLen {
 		chunkLen = remaining
 	}
@@ -340,14 +358,32 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 		}
 		req.ContentLength = chunkLen
 
+		// Measure throughput from just before HTTP.Do (so the wall time
+		// reflects request body upload + response header wait, NOT the
+		// preceding disk read or checksum compute).
+		attemptStart := time.Now()
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
+			// Surface a more actionable error when the server failed to
+			// start sending response headers within the configured
+			// transport timeout. On slow / saturated uplinks the user's
+			// best lever is a smaller --chunk-size; mention it
+			// explicitly. The timeout duration is read from the live
+			// transport so the message reflects what was actually used,
+			// not just the package-level default.
+			if isResponseHeaderTimeout(err) {
+				err = fmt.Errorf(
+					"timed out waiting %s for response headers after sending %d bytes; "+
+						"consider --chunk-size <smaller> or check upstream bandwidth: %w",
+					responseHeaderTimeoutOf(c.HTTP), chunkLen, err,
+				)
+			}
 			if !IsRetryable(err) {
 				return backoff.Permanent(err)
 			}
 			// Refresh offset before next attempt: server may have absorbed
 			// part of the chunk before the connection died.
-			if err := c.refreshChunker(ctx, uploadURL, ch, &startOffset, &chunkLen); err != nil {
+			if err := c.refreshChunker(ctx, uploadURL, ch, &startOffset, &chunkLen, sizer); err != nil {
 				return err // already classified
 			}
 			// Sync the progress reporter to whatever the server actually
@@ -377,6 +413,9 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 			if prog != nil && delta > 0 {
 				prog.Add(delta)
 			}
+			// Feed the adaptive sizer the throughput observed on this
+			// PATCH so subsequent chunks adjust to current link speed.
+			sizer.observe(delta, time.Since(attemptStart))
 			return nil
 		}
 
@@ -393,7 +432,10 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 			}
 			startOffset = off
 			remaining := ch.Size() - startOffset
-			chunkLen = ch.ChunkSize()
+			chunkLen = sizer.size()
+			if chunkLen <= 0 {
+				chunkLen = ch.ChunkSize()
+			}
 			if remaining < chunkLen {
 				chunkLen = remaining
 			}
@@ -420,7 +462,7 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 			// terminal failures, and a transient server error must not
 			// be reported with permanent semantics until backoff has
 			// actually given up.
-			if err := c.refreshChunker(ctx, uploadURL, ch, &startOffset, &chunkLen); err != nil {
+			if err := c.refreshChunker(ctx, uploadURL, ch, &startOffset, &chunkLen, sizer); err != nil {
 				return err
 			}
 			if prog != nil {
@@ -457,8 +499,9 @@ func (c *Client) patchOne(ctx context.Context, uploadURL string, ch *Chunker, pr
 
 // refreshChunker HEADs the upload to learn the server's current offset, then
 // seeks the chunker to it and updates startOffset/chunkLen. Used between
-// retries so the next attempt sends the correct bytes.
-func (c *Client) refreshChunker(ctx context.Context, uploadURL string, ch *Chunker, startOffset, chunkLen *int64) error {
+// retries so the next attempt sends the correct bytes. sizer (when non-nil)
+// supplies the chunk length so retries inherit any adaptive shrinkage.
+func (c *Client) refreshChunker(ctx context.Context, uploadURL string, ch *Chunker, startOffset, chunkLen *int64, sizer *adaptiveSizer) error {
 	off, herr := c.headOffset(ctx, uploadURL)
 	if herr != nil {
 		if !IsRetryable(herr) {
@@ -469,10 +512,14 @@ func (c *Client) refreshChunker(ctx context.Context, uploadURL string, ch *Chunk
 	}
 	*startOffset = off
 	remaining := ch.Size() - off
-	*chunkLen = ch.ChunkSize()
-	if remaining < *chunkLen {
-		*chunkLen = remaining
+	cl := sizer.size()
+	if cl <= 0 {
+		cl = ch.ChunkSize()
 	}
+	if remaining < cl {
+		cl = remaining
+	}
+	*chunkLen = cl
 	if err := ch.SeekTo(off); err != nil {
 		return backoff.Permanent(err)
 	}
