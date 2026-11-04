@@ -19,7 +19,8 @@ Pre-release. Wire protocol unstable.
 ./scripts/clean.sh   # remove dist/
 ```
 
-Open `ferry.code-workspace` in VS Code to pick up the recommended Go editor settings.
+Open the repository folder in VS Code to pick up the recommended Go editor settings from
+`.vscode/settings.json`.
 
 ## Running the receiver
 
@@ -43,6 +44,7 @@ The config file is JSON. Defaults are applied for any missing fields:
 ```
 
 A background sweeper runs every `gc_interval_seconds` and removes:
+
 - completed uploads older than `completed_retention_seconds`
 - incomplete uploads past `expires_at` (`created_at + incomplete_retention_seconds`)
 - orphan `.info` sidecars whose binary is missing
