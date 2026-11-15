@@ -25,3 +25,8 @@ coverage.html
 /.vscode/*
 !/.vscode/extensions.json
 !/.vscode/settings.json
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
